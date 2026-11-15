@@ -8612,7 +8612,41 @@ struct BarAnim {
     double start = 0;
     bool animating = false, managed = false;
     bool gpu = false;  // this slide moves the page on the compositor (Dia's start page, see below)
+    bool overlay = false;  // "Over the page": the page stays put, only the toolbar slides (see below)
+    // Over the page: the toolbar and its containers up to the group, raised above their siblings (Dia's
+    // start page is XAML laid after it), with the z-index each had.
+    std::vector<std::pair<winrt::weak_ref<mux::UIElement>, int>> raised;
 };
+
+// "Over the page" (hideToolbar = overlay): the page container stays moved up by the toolbar's height,
+// hidden or shown, so the page never moves or resizes. Only the toolbar slides, by a translation that
+// brings it back down over the top of the page. Web pages are Chromium windows above all of Dia's XAML,
+// so the toolbar can't draw over them: while it's out, their top is cut away (a window region) by as
+// much as the toolbar covers, and the toolbar shows (and takes clicks) there.
+static bool OverlayToolbar() { return Engine_TweakValue(L"hideToolbar") == L"overlay"; }
+static void UpdatePageClips();
+
+static void RaiseBar(BarAnim& a, bool raise) {
+    if (!raise) {
+        for (auto& [w, z] : a.raised)
+            if (auto el = w.get()) muxc::Canvas::SetZIndex(el, z);
+        a.raised.clear();
+        return;
+    }
+    if (!a.raised.empty()) return;
+    auto g = a.group.get();
+    auto b = a.bar.get();
+    if (!g || !b) return;
+    for (mux::DependencyObject d = b; d && d != g;) {
+        auto parent = muxm::VisualTreeHelper::GetParent(d);
+        if (parent.try_as<muxc::Panel>())
+            if (auto el = d.try_as<mux::UIElement>()) {
+                a.raised.push_back({winrt::make_weak(el), muxc::Canvas::GetZIndex(el)});
+                muxc::Canvas::SetZIndex(el, 1000);
+            }
+        d = parent;
+    }
+}
 
 // Dia's start page (New Tab) is drawn in XAML with effects, so moving it by margin re-lays it out every
 // frame and stutters. For it, the slide runs as a compositor translation and the margin is set once,
@@ -8656,6 +8690,17 @@ static double BarHeight(BarAnim& a) {
 static void ApplyOffset(BarAnim& a, double h, bool settled) {
     auto g = a.group.get();
     if (!g) return;
+    if (a.overlay) {
+        mux::Thickness m{a.saved.Left, a.saved.Top - h, a.saved.Right, a.saved.Bottom};
+        auto cur = g.Margin();
+        if (cur.Left != m.Left || cur.Top != m.Top || cur.Right != m.Right || cur.Bottom != m.Bottom) g.Margin(m);
+        if (auto b = a.bar.get()) {
+            float y = (float)(a.offset + h);
+            if (b.Translation().y != y) b.Translation({0.0f, y, 0.0f});
+        }
+        RaiseBar(a, true);
+        return;
+    }
     double top = a.offset;
     // On Dia's start page the page keeps one height even when settled (it centers its content, so a
     // resize would make it jump); websites fit the window once the slide ends.
@@ -8702,6 +8747,7 @@ static void OnRendering(wf::IInspectable const&, wf::IInspectable const&) {
         if (!a.gpu) ApplyOffset(a, h, false);
         any = true;
     }
+    UpdatePageClips();  // (the cut-away top of the page follows the sliding toolbar)
     for (auto& [h, st] : t_arc)
         if (st.address.get()) FlushArcTrailing(st);
     if (!any) EnsureRendering(false);
@@ -8776,6 +8822,21 @@ static void UpdateHiddenToolbar() {
             a.to = 0;
         }
         auto barEl = a.bar.get();
+        // Over the page moves the toolbar itself, so it has to be the one on screen: Dia shows another
+        // toolbar on its start page (the one found first is then left empty, with no size).
+        if (a.overlay && (!barEl || barEl.ActualWidth() < 1)) {
+            auto live = FindVisual(group, [](const mux::DependencyObject& d) {
+                auto fe = d.try_as<mux::FrameworkElement>();
+                return fe && fe.Name() == L"NavigationBarHost" && fe.ActualWidth() >= 1;
+            }).try_as<mux::FrameworkElement>();
+            if (live && live != barEl) {
+                RaiseBar(a, false);
+                if (barEl) barEl.Translation({0.0f, 0.0f, 0.0f});
+                a.bar = winrt::make_weak(live);
+                barEl = live;
+                ApplyOffset(a, BarHeight(a), !a.animating);
+            }
+        }
         extern bool Tidy_Quiet();
         // Typing in the address bar (Ctrl+L) keeps it out; not while Tidy Tabs works its hidden chat (its
         // Chat button, in the toolbar, takes focus as the chat opens and gets it back as it closes).
@@ -8787,6 +8848,18 @@ static void UpdateHiddenToolbar() {
         bool want = !hide || show || focused;
         double h = BarHeight(a);
         double target = want ? 0 : -h;
+        // Over the page or pushing it down (switching the option, or the tweak going off, which hands the
+        // page back to Dia's layout): finish any slide where it was heading, then carry on the new way.
+        bool overlay = hide && Engine_TweakOn(L"hideToolbar") && OverlayToolbar();
+        if (a.overlay != overlay) {
+            if (a.gpu) SetTranslation(group, 0, false, 0), a.gpu = false;
+            if (a.overlay && barEl) barEl.Translation({0.0f, 0.0f, 0.0f});
+            if (a.overlay) RaiseBar(a, false);
+            a.overlay = overlay;
+            a.animating = false;
+            a.offset = a.to;
+            ApplyOffset(a, h, true);
+        }
         if (!hide && !a.animating && a.offset > -0.5) {
             // Tweak off and the toolbar is fully back: hand Dia its own margin back.
             group.Margin(a.saved);
@@ -8806,14 +8879,108 @@ static void UpdateHiddenToolbar() {
         a.to = target;
         a.start = NowMs();
         a.animating = true;
-        a.gpu = Ui_State(L"newTab");
+        a.gpu = !a.overlay && Ui_State(L"newTab");
         if (!want || a.gpu) ApplyOffset(a, h, false);  // grow the page once up front; then it only moves
         if (a.gpu) SetTranslation(group, (float)(target - a.from), true, kSlideMs);
         EnsureRendering(true);
     }
     for (auto it = t_bars.begin(); it != t_bars.end();)
         it = it->second.group.get() ? std::next(it) : t_bars.erase(it);
+    UpdatePageClips();
     UpdateCaptionsForToolbar();
+}
+
+// ---- Over the page: the page windows' tops cut away under the toolbar.
+// The windows given a region here, with the rects last cut from each (window pixels).
+static thread_local std::map<HWND, std::vector<RECT>> t_pageClips;
+
+static void UnclipPage(HWND w) {
+    if (IsWindow(w)) SetWindowRgn(w, nullptr, TRUE);
+}
+
+static void UpdatePageClips() {
+    // Where each window's overlaid toolbars are now, in screen pixels.
+    std::map<HWND, std::vector<RECT>> bars;
+    for (auto& [hnd, a] : t_bars) {
+        if (!a.managed || !a.overlay) continue;
+        auto g = a.group.get();
+        auto b = a.bar.get();
+        if (!g || !b) continue;
+        auto root = g.XamlRoot();
+        if (!root) continue;
+        double h = BarHeight(a);
+        double shown = a.offset + h;  // how much of the toolbar is in the window
+        if (shown < 0.5) continue;
+        HWND top = TopWindowFor(root);
+        if (!top) continue;
+        double sc = root.RasterizationScale();
+        // The group sits a toolbar's height above where Dia would put it; the toolbar is at its top and
+        // slides down by `shown`.
+        auto at = g.TransformToVisual(nullptr).TransformPoint({0, 0});
+        double barLeft = b.TransformToVisual(g).TransformPoint({0, 0}).X + at.X;
+        POINT origin{0, 0};
+        ClientToScreen(top, &origin);
+        RECT r{origin.x + (LONG)std::floor(barLeft * sc), origin.y + (LONG)std::floor((at.Y + h) * sc),
+               origin.x + (LONG)std::ceil((barLeft + b.ActualWidth()) * sc),
+               origin.y + (LONG)std::ceil((at.Y + h + shown) * sc)};
+        if (r.right > r.left && r.bottom > r.top) bars[top].push_back(r);
+    }
+    // Every page window (Dia's Chromium windows, not the Tidy Tabs chat kept hidden) under one of them.
+    std::map<HWND, std::vector<RECT>> want;
+    for (auto& [top, rects] : bars) {
+        struct Ctx {
+            HWND top;
+            const std::vector<RECT>* rects;
+            std::map<HWND, std::vector<RECT>>* want;
+        } ctx{top, &rects, &want};
+        EnumChildWindows(top, [](HWND w, LPARAM l) -> BOOL {
+            auto& c = *(Ctx*)l;
+            if (GetParent(w) != c.top) return TRUE;
+            wchar_t cls[64];
+            GetClassNameW(w, cls, 64);
+            RECT wr, on;
+            if (wcscmp(cls, L"Chrome_WidgetWin_1") || t_tidyMasked.count(w) || !IsWindowVisible(w) || !GetWindowRect(w, &wr))
+                return TRUE;
+            std::vector<RECT> cut;
+            for (auto& r : *c.rects)
+                if (IntersectRect(&on, &r, &wr)) cut.push_back({on.left - wr.left, on.top - wr.top, on.right - wr.left, on.bottom - wr.top});
+            if (!cut.empty()) (*c.want)[w] = cut;
+            return TRUE;
+        }, (LPARAM)&ctx);
+    }
+    auto same = [](const std::vector<RECT>& x, const std::vector<RECT>& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); i++)
+            if (!EqualRect(&x[i], &y[i])) return false;
+        return true;
+    };
+    for (auto it = t_pageClips.begin(); it != t_pageClips.end();) {
+        if (!want.count(it->first)) {
+            UnclipPage(it->first);
+            it = t_pageClips.erase(it);
+        } else
+            ++it;
+    }
+    for (auto& [w, cut] : want) {
+        auto old = t_pageClips.find(w);
+        if (old != t_pageClips.end() && same(old->second, cut)) continue;
+        if (old == t_pageClips.end()) {
+            // A shape someone else gave it (Dia's, or another tweak's): leave that window alone.
+            HRGN cur = CreateRectRgn(0, 0, 0, 0);
+            bool has = GetWindowRgn(w, cur) != ERROR;
+            DeleteObject(cur);
+            if (has) continue;
+        }
+        // Everything (the window can grow) but the toolbar.
+        HRGN rgn = CreateRectRgn(-32768, -32768, 32767, 32767);
+        for (auto& r : cut) {
+            HRGN hole = CreateRectRgnIndirect(&r);
+            CombineRgn(rgn, rgn, hole, RGN_DIFF);
+            DeleteObject(hole);
+        }
+        SetWindowRgn(w, rgn, TRUE);  // the system now owns `rgn`
+        t_pageClips[w] = cut;
+    }
 }
 
 // Dia also lays an invisible window over the toolbar strip (BoostBrowser.WindowCaptionInputSink before

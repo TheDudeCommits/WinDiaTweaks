@@ -28,7 +28,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Square corners by the sidebar | Pages meet the sidebar and window edges with straight corners |
 | Hide link address ✨ | Hides the address Dia shows at the bottom left while the pointer is over a link |
 | **Toolbar** | |
-| Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window |
+| Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window, sliding over the page so it stays put (or, as before, pushing it down) |
 | Show toolbar with the sidebar | With the toolbar hidden, shows it while the sidebar is open |
 | Show toolbar on new tab pages | With the toolbar hidden, keeps it on new tab pages |
 | Toolbar color ✨ | Adaptive (follows the site, Dia's default) or Sidebar (same color or window material as the sidebar) |
