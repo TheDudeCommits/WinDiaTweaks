@@ -148,6 +148,13 @@ bool IsDia(const wmc::GlobalSystemMediaTransportControlsSession& s) {
     return id.find(L"TheBrowserCompany.Dia") != std::wstring::npos;
 }
 
+// A session that's closing can hand back null info (GetPlaybackInfo, TryGetMediaPropertiesAsync, ...).
+// A call on a null WinRT object is an access violation, which catch (...) doesn't stop: it took Dia down.
+bool IsPlaying(const wmc::GlobalSystemMediaTransportControlsSession& s) {
+    auto info = s ? s.GetPlaybackInfo() : nullptr;
+    return info && info.PlaybackStatus() == wmc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+}
+
 void WorkerBody() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
@@ -196,13 +203,12 @@ void WorkerBody() {
             wmc::GlobalSystemMediaTransportControlsSession pick{nullptr}, playing{nullptr};
             bool lastThere = false;
             for (auto const& s : mgr.GetSessions()) {
-                if (!IsDia(s)) continue;
+                if (!s || !IsDia(s)) continue;
                 if (!pick) pick = s;
                 if (last && s == last) lastThere = true;
-                if (!playing && s.GetPlaybackInfo().PlaybackStatus() == wmc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
-                    playing = s;
+                if (!playing && IsPlaying(s)) playing = s;
             }
-            if (lastThere && last.GetPlaybackInfo().PlaybackStatus() == wmc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
+            if (lastThere && IsPlaying(last))
                 pick = last;
             else if (playing) pick = playing;
             else if (lastThere) pick = last;
@@ -240,10 +246,11 @@ void WorkerBody() {
                 Log("media: %s %s", what[c.kind], ok ? "sent" : "refused");
             }
             Smtc s;
-            if (pick) {
-                auto props = Await(pick.TryGetMediaPropertiesAsync(), "metadata");
-                auto info = pick.GetPlaybackInfo();
-                auto ctl = info.Controls();
+            auto props = pick ? Await(pick.TryGetMediaPropertiesAsync(), "metadata") : nullptr;
+            auto info = pick ? pick.GetPlaybackInfo() : nullptr;
+            auto ctl = info ? info.Controls() : nullptr;
+            auto tl = pick ? pick.GetTimelineProperties() : nullptr;
+            if (props && info && ctl && tl) {
                 s.has = true;
                 s.title = props.Title();
                 s.artist = props.Artist();
@@ -253,7 +260,6 @@ void WorkerBody() {
                 s.canPrev = ctl.IsPreviousEnabled();
                 // Chromium reports the position only when it changes course (play, pause, seek), with the
                 // time it did: carried forward to now while playing.
-                auto tl = pick.GetTimelineProperties();
                 s.duration = (tl.EndTime() - tl.StartTime()).count() / 1e7;
                 s.canSeek = ctl.IsPlaybackPositionEnabled() && s.duration > 0;
                 if (auto r = info.PlaybackRate()) s.rate = r.Value() > 0 ? r.Value() : 1;
