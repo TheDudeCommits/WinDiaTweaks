@@ -6222,22 +6222,18 @@ static void FlushArcTrailing(ArcState& st) {
             auto panel = parent.try_as<muxc::Panel>();
             if (layer && panel) {
                 // Paint order at that panel (all z 0, by index): page (with this toolbar), ..., sidebar, then
-                // Dia's overlay layers (command bar, ...). Keep that order but put the page just above the
-                // sidebar: sidebar 1, page 2, everything after the sidebar 3. (Not above the overlays: the page
-                // would cover the command bar.)
-                auto setZ = [&](const mux::UIElement& el, int z) {
-                    bool known = false;
-                    for (auto& [w, orig] : st.zSaved) known |= w.get() == el;
-                    if (!known) st.zSaved.push_back({winrt::make_weak(el), muxc::Canvas::GetZIndex(el)});
-                    if (muxc::Canvas::GetZIndex(el) < z) muxc::Canvas::SetZIndex(el, z);
-                };
-                bool afterSidebar = false;
+                // Dia's overlay layers (command bar, ...). Keep that order but put the page above the sidebar,
+                // by sending the sidebar to the bottom (z -1) rather than raising the page: layers Dia adds
+                // later (z 0, last) still paint on top, as Dia means them to. Its fullscreen layer (#77) is one:
+                // under a raised page it was hidden behind it, showing only through the sidebar.
                 for (auto const& c : panel.Children()) {
-                    if (c == layer) continue;
-                    if (std::find(chain.begin(), chain.end(), c) != chain.end()) setZ(c, 1), afterSidebar = true;
-                    else if (afterSidebar) setZ(c, 3);
+                    if (c == layer || std::find(chain.begin(), chain.end(), c) == chain.end()) continue;
+                    bool known = false;
+                    for (auto& [w, orig] : st.zSaved) known |= w.get() == c;
+                    if (!known) st.zSaved.push_back({winrt::make_weak(c), muxc::Canvas::GetZIndex(c)});
+                    if (muxc::Canvas::GetZIndex(c) > -1) muxc::Canvas::SetZIndex(c, -1);
+                    break;
                 }
-                if (afterSidebar) setZ(layer, 2);
             }
             break;
         }
