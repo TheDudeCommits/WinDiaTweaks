@@ -4691,8 +4691,10 @@ static void EnsureTidyFrames() {
     });
 }
 
+static muxc::StackPanel FirstRowsPanel(const muxc::ScrollViewer& sv);
+
 static size_t TabsBelow(const muxc::ScrollViewer& sv) {
-    auto rows = FirstIn(sv, [](const mux::FrameworkElement& fe) { return fe.Name() == L"RowsPanel"; }).try_as<muxc::StackPanel>();
+    auto rows = FirstRowsPanel(sv);
     if (!rows || !rows.Children().Size()) return 0;
     auto canvas = rows.Children().GetAt(0).try_as<muxc::Canvas>();
     return canvas ? canvas.Children().Size() : 0;
@@ -4907,12 +4909,79 @@ static bool DiaSepAsking(const muxc::Grid& sep) {
     return t == L"clear";
 }
 
+// Dia's named elements inside one tab list (its TabSeparatorRow dividers, its RowsPanels), top first.
+// Found from the engine's list of elements and a short walk up from each, not by walking down through
+// every tab (with many pinned tabs the divider sits thousands of elements in). Kept until the tree
+// changes (a tab added, closed, moved, pinned...), and looked up again at most every 2 s otherwise.
+struct TabListParts {
+    winrt::weak_ref<muxc::ScrollViewer> list;
+    unsigned long long revision = ~0ull;
+    ULONGLONG found = 0;
+    std::vector<winrt::weak_ref<mux::FrameworkElement>> seps, rows;
+};
+static thread_local std::vector<TabListParts> t_tabListParts;
+
+static bool InsideOf(const mux::DependencyObject& el, const mux::DependencyObject& ancestor) {
+    int n = 0;
+    for (auto p = muxm::VisualTreeHelper::GetParent(el); p && n++ < 200; p = muxm::VisualTreeHelper::GetParent(p))
+        if (p == ancestor) return true;
+    return false;
+}
+
+static TabListParts& PartsOf(const muxc::ScrollViewer& sv) {
+    auto revision = Engine_TreeRevision();
+    auto now = GetTickCount64();
+    TabListParts* parts = nullptr;
+    for (auto it = t_tabListParts.begin(); it != t_tabListParts.end();) {
+        auto l = it->list.get();
+        if (!l) {
+            it = t_tabListParts.erase(it);
+            continue;
+        }
+        if (l == sv) parts = &*it;
+        ++it;
+    }
+    if (!parts) parts = &t_tabListParts.emplace_back(), parts->list = winrt::make_weak(sv);
+    if (parts->revision == revision && now - parts->found < 2000) return *parts;
+    parts->revision = revision, parts->found = now;
+    auto collect = [&](const wchar_t* name, std::vector<winrt::weak_ref<mux::FrameworkElement>>& out) {
+        std::vector<std::pair<double, mux::FrameworkElement>> found;
+        for (auto h : FindNodes(name)) {
+            try {  // (an element of another window's thread can't be used from here: skipped)
+                auto fe = Obj<mux::FrameworkElement>(h);
+                if (!fe || !InsideOf(fe, sv)) continue;
+                // Top to bottom, as a walk down the list meets them; ones not laid out (collapsed) last.
+                double y = fe.ActualHeight() > 0 ? fe.TransformToVisual(sv).TransformPoint({0, 0}).Y : 1e9;
+                found.push_back({y, fe});
+            } catch (...) {
+            }
+        }
+        std::stable_sort(found.begin(), found.end(), [](auto& a, auto& b) { return a.first < b.first; });
+        out.clear();
+        for (auto& [y, fe] : found) out.push_back(winrt::make_weak(fe));
+    };
+    collect(L"TabSeparatorRow", parts->seps);
+    collect(L"RowsPanel", parts->rows);
+    return *parts;
+}
+
+// The tab list's first RowsPanel (as the walk down found it: the top one).
+static muxc::StackPanel FirstRowsPanel(const muxc::ScrollViewer& sv) {
+    for (auto& w : PartsOf(sv).rows)
+        if (auto p = w.get().try_as<muxc::StackPanel>()) return p;
+    return nullptr;
+}
+
 // Dia's lasting divider below pinned tabs, in this tab list (it scrolls with the tabs), if it's shown.
 static muxc::Grid DiaPinnedSep(const muxc::ScrollViewer& sv) {
-    auto sep = FirstIn(sv, [](const mux::FrameworkElement& fe) {
-        return fe.Name() == L"TabSeparatorRow" && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0;
-    }).try_as<muxc::Grid>();
-    return sep && sep.IsLoaded() && sep.ColumnDefinitions().Size() >= 2 && !DiaSepAsking(sep) ? sep : nullptr;
+    if (!sv) return nullptr;
+    for (auto& w : PartsOf(sv).seps) {
+        auto fe = w.get();
+        if (!fe || fe.Visibility() != mux::Visibility::Visible || fe.ActualHeight() <= 0) continue;
+        auto sep = fe.try_as<muxc::Grid>();
+        return sep && sep.IsLoaded() && sep.ColumnDefinitions().Size() >= 2 && !DiaSepAsking(sep) ? sep : nullptr;
+    }
+    return nullptr;
 }
 
 // With pinned tabs, Tidy is about the other tabs only: the prompt says so and names the pinned ones (the
@@ -5166,6 +5235,25 @@ static void UpdateTidyTabs() {
         }
         if (!full) return;
     }
+    // How long the full scans take, logged now and then (a minute in, then every 10 minutes).
+    struct ScanTimer {
+        LARGE_INTEGER a{};
+        bool on;
+        explicit ScanTimer(bool on) : on(on) { QueryPerformanceCounter(&a); }
+        ~ScanTimer() {
+            if (!on) return;
+            static thread_local double total = 0, worst = 0;
+            static thread_local int n = 0, reports = 0;
+            LARGE_INTEGER b, f;
+            QueryPerformanceCounter(&b), QueryPerformanceFrequency(&f);
+            double ms = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+            total += ms, worst = (std::max)(worst, ms), n++;
+            if (n >= (reports ? 1200 : 120)) {
+                Log("tidy: scan %.1f ms on average, %.1f ms at most (%d scans, %zu rows)", total / n, worst, n, t_tidyRows.size());
+                total = worst = 0, n = 0, reports++;
+            }
+        }
+    } timer(on);
     auto look = TidyOptions();
     for (auto it = t_tidyRows.begin(); it != t_tidyRows.end();) {
         auto& r = **it;
