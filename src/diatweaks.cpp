@@ -623,7 +623,7 @@ namespace wdm = winrt::Windows::Management::Deployment;
 namespace wweb = winrt::Windows::Web::Http;
 using winrt::Windows::Foundation::Uri;
 
-static const wchar_t kRepo[] = L"zioder/WinDiaTweaks";
+static const wchar_t kRepo[] = L"TheDudeCommits/WinDiaTweaks";  // updates come from this fork
 static const wchar_t kZip[] = L"WinDiaTweaks.zip";
 static const wchar_t kDiaFamily[] = L"TheBrowserCompany.Dia_ttt1ap7aakyb4";
 

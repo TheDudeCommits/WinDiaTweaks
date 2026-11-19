@@ -6037,6 +6037,8 @@ struct ArcState {
     // Icons inside the buttons that Dia colored directly: (icon, property, Dia's value)
     std::vector<std::tuple<winrt::weak_ref<mux::DependencyObject>, mux::DependencyProperty, wf::IInspectable>> iconTint;
     bool hover = false, trailingShown = true; // pointer over the pill; ☆ / ⋯ currently visible
+    bool headerHover = false;
+    winrt::weak_ref<mux::FrameworkElement> logoWatched;  // pointer over the header row: the Dia logo shows, like Arc on the Mac shows its window buttons
     std::vector<std::pair<winrt::weak_ref<mux::FrameworkElement>, int>> shifted;  // Dia rows we moved down
     std::vector<Moved> moved;               // the active tab's toolbar items, currently in our rows
     winrt::weak_ref<mux::FrameworkElement> source;  // the active tab's (now emptied) toolbar
@@ -6447,6 +6449,27 @@ static void HeaderSet(ArcState& st, const mux::DependencyObject& o, const mux::D
     o.SetValue(dp, v);
 }
 
+static void ArcStyleHeader(ArcState& st);
+
+// The logo shows while the pointer is over it or over the sidebar button beside it, and hides once it's over neither.
+static void WatchArcLogo(ArcState& st, const mux::FrameworkElement& logo, const mux::FrameworkElement& left) {
+    if (st.logoWatched.get() == logo) return;
+    st.logoWatched = winrt::make_weak(logo);
+    for (auto el : {logo, left}) {
+        el.PointerEntered([](wf::IInspectable const&, auto&&) {
+            for (auto& [h, s] : t_arc)
+                if (!s.headerHover) s.headerHover = true, ArcStyleHeader(s);
+        });
+        el.PointerExited([](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e) {
+            for (auto& [h, s] : t_arc) {
+                auto lg = s.logoWatched.get(), lf = s.left.get().try_as<mux::FrameworkElement>();
+                if (!s.headerHover || (lg && InBounds(lg, e)) || (lf && InBounds(lf, e))) continue;
+                s.headerHover = false, ArcStyleHeader(s);
+            }
+        });
+    }
+}
+
 // Arc's header row: every icon the same size, color and height, in one tight row. The logo, then the
 // sidebar button right next to it; back / forward / reload at the right end, against Dia's ⌄ button
 // (or against the edge, at the logo's distance, when that button is hidden).
@@ -6471,14 +6494,19 @@ static void ArcStyleHeader(ArcState& st) {
     } catch (...) {
         return;
     }
-    double edge = logoX;  // same margin at both ends
+    double edge = 2;  // reload's centre 18 px from the edge, as on the Mac
     if (overflow && overflow.Visibility() == mux::Visibility::Visible && overflow.ActualWidth() > 0)
         try {
             edge = header.ActualWidth() - overflow.TransformToVisual(header).TransformPoint({0, 0}).X;
         } catch (...) {
         }
     int cols = (int)header.ColumnDefinitions().Size();
-    for (auto [el, m, ha] : {std::tuple{left, mux::Thickness{logoX + logo.ActualWidth(), top, 0, 0}, mux::HorizontalAlignment::Left},
+    // Like the Mac's window buttons: the Dia logo (its app menu) stays out of sight until the pointer comes to
+    // it, and the sidebar button sits in its place meanwhile, stepping aside when it shows.
+    WatchArcLogo(st, logo, left);
+    double shown = st.headerHover ? 1 : 0;
+    if (std::abs(logo.Opacity() - shown) > 0.01) HeaderSet(st, logo, mux::UIElement::OpacityProperty(), winrt::box_value(shown));
+    for (auto [el, m, ha] : {std::tuple{left, mux::Thickness{logoX + logo.ActualWidth() * shown, top, 0, 0}, mux::HorizontalAlignment::Left},
                              std::tuple{right, mux::Thickness{0, top, edge, 0}, mux::HorizontalAlignment::Right}}) {
         if (muxc::Grid::GetColumn(el) != 0) muxc::Grid::SetColumn(el, 0);
         if (cols > 1 && muxc::Grid::GetColumnSpan(el) != cols) muxc::Grid::SetColumnSpan(el, cols);
@@ -6546,6 +6574,13 @@ static void ArcStyleHeader(ArcState& st) {
     if (std::abs(path.Height() - icon) > 0.1 || std::isnan(path.Height())) HeaderSet(st, path, mux::FrameworkElement::HeightProperty(), winrt::box_value(icon));
 }
 
+// The pill's fill, as on the Mac: a little lighter than the sidebar, a little lighter again under the pointer.
+static muxm::Brush ArcPillBrush(const mux::FrameworkElement& pill, bool hovered) {
+    bool dark = !pill || pill.ActualTheme() != mux::ElementTheme::Light;
+    uint8_t a = dark ? (hovered ? 0x24 : 0x1a) : (hovered ? 0x17 : 0x0f);
+    return muxm::SolidColorBrush(dark ? Rgba(0xff, 0xff, 0xff, a) : Rgba(0, 0, 0, a));
+}
+
 // Two rows under the sidebar header: [toggle .... back forward reload] and the address pill.
 static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
     muxc::RowDefinition row;
@@ -6570,7 +6605,7 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
     right.Orientation(muxc::Orientation::Horizontal);
     right.HorizontalAlignment(mux::HorizontalAlignment::Right);
     right.VerticalAlignment(mux::VerticalAlignment::Center);
-    right.Spacing(0);
+    right.Spacing(3);  // 35 px from one button to the next, as on the Mac
     left.Name(L"diatweaksArcLeft");
     right.Name(L"diatweaksArcRight");
     muxc::Grid::SetColumn(left, 1);
@@ -6585,8 +6620,8 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
     // bar (what Ctrl+L does), which Arc mode anchors over the pill; the ☆ and ⋯ buttons work as usual.
     muxc::Grid url;
     url.Margin({4, 0, 4, 0});
-    url.MinHeight(32);
-    url.CornerRadius({8, 8, 8, 8});
+    url.MinHeight(35);
+    url.CornerRadius({10, 10, 10, 10});
     bar.Children().Append(url);
     // Arc shows just the site in the pill: Dia's own text ("site / page title") stays in place but
     // invisible, and this label shows the site, trimmed with … before the ☆ / ⋯ buttons.
@@ -6596,21 +6631,27 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
     label.VerticalAlignment(mux::VerticalAlignment::Center);
     label.TextTrimming(mux::TextTrimming::CharacterEllipsis);
     label.TextWrapping(mux::TextWrapping::NoWrap);
-    label.FontSize(14);
+    label.FontSize(13);
     url.Children().Append(label);
     st.label = winrt::make_weak(label);
     url.PointerEntered([](wf::IInspectable const& sender, auto&&) {
         for (auto& [h, st] : t_arc)
-            if (st.url.get() == sender.try_as<muxc::Panel>()) st.hover = true, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+            if (st.url.get() == sender.try_as<muxc::Panel>()) {
+                st.hover = true, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+                if (auto u = st.url.get()) u.Background(ArcPillBrush(u, true));
+            }
     });
     url.PointerExited([](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e) {
         // The ☆ / ⋯ buttons drawn over the pill aren't in its tree, and opening their menu takes the
         // pointer too: only a pointer actually outside the pill hides them.
         if (InBounds(sender.try_as<mux::FrameworkElement>(), e)) return;
         for (auto& [h, st] : t_arc)
-            if (st.url.get() == sender.try_as<muxc::Panel>()) st.hover = false, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+            if (st.url.get() == sender.try_as<muxc::Panel>()) {
+                st.hover = false, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+                if (auto u = st.url.get()) u.Background(ArcPillBrush(u, false));
+            }
     });
-    url.Background(BrushRes(L"ControlFillColorDefaultBrush", Rgba(0xff, 0xff, 0xff, 0x0f)));  // the pill itself
+    url.Background(ArcPillBrush(url, false));  // the pill itself
     url.AddHandler(mux::UIElement::TappedEvent(),
                    winrt::box_value(mux::Input::TappedEventHandler([](wf::IInspectable const&,
                                                                         mux::Input::TappedRoutedEventArgs const& e) {
