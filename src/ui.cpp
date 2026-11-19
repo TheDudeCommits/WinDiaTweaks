@@ -6536,6 +6536,10 @@ static void ArcStyleHeader(ArcState& st) {
         mux::Thickness m{(std::max)(0.0, contentStart - colStart), dy, (std::max)(0.0, colEnd - rightStart + 4), -dy};
         if (std::abs(c.Left - m.Left) > 0.1 || std::abs(c.Right - m.Right) > 0.1 || std::abs(c.Top - m.Top) > 0.1)
             HeaderSet(st, host, mux::FrameworkElement::MarginProperty(), winrt::box_value(m));
+        // As on the Mac, the name makes way: between the sidebar button and ← → ↻ only its first letter fits.
+        // The list below still says which space this is.
+        if (host.Opacity() != 0) HeaderSet(st, host, mux::UIElement::OpacityProperty(), winrt::box_value(0.0));
+        if (host.IsHitTestVisible()) HeaderSet(st, host, mux::UIElement::IsHitTestVisibleProperty(), winrt::box_value(false));
     }
     // The Dia logo: a faint 16 px shape; drawn like the other icons (their color, optically their size).
     auto ref = FindByName(st.right.get(), L"BackButton").try_as<muxc::Control>();
