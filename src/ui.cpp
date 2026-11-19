@@ -6037,8 +6037,6 @@ struct ArcState {
     // Icons inside the buttons that Dia colored directly: (icon, property, Dia's value)
     std::vector<std::tuple<winrt::weak_ref<mux::DependencyObject>, mux::DependencyProperty, wf::IInspectable>> iconTint;
     bool hover = false, trailingShown = true; // pointer over the pill; ☆ / ⋯ currently visible
-    bool headerHover = false;
-    winrt::weak_ref<mux::FrameworkElement> logoWatched;  // pointer over the header row: the Dia logo shows, like Arc on the Mac shows its window buttons
     std::vector<std::pair<winrt::weak_ref<mux::FrameworkElement>, int>> shifted;  // Dia rows we moved down
     std::vector<Moved> moved;               // the active tab's toolbar items, currently in our rows
     winrt::weak_ref<mux::FrameworkElement> source;  // the active tab's (now emptied) toolbar
@@ -6452,25 +6450,6 @@ static void HeaderSet(ArcState& st, const mux::DependencyObject& o, const mux::D
 
 static void ArcStyleHeader(ArcState& st);
 
-// The logo shows while the pointer is over it or over the sidebar button beside it, and hides once it's over neither.
-static void WatchArcLogo(ArcState& st, const mux::FrameworkElement& logo, const mux::FrameworkElement& left) {
-    if (st.logoWatched.get() == logo) return;
-    st.logoWatched = winrt::make_weak(logo);
-    for (auto el : {logo, left}) {
-        el.PointerEntered([](wf::IInspectable const&, auto&&) {
-            for (auto& [h, s] : t_arc)
-                if (!s.headerHover) s.headerHover = true, ArcStyleHeader(s);
-        });
-        el.PointerExited([](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e) {
-            for (auto& [h, s] : t_arc) {
-                auto lg = s.logoWatched.get(), lf = s.left.get().try_as<mux::FrameworkElement>();
-                if (!s.headerHover || (lg && InBounds(lg, e)) || (lf && InBounds(lf, e))) continue;
-                s.headerHover = false, ArcStyleHeader(s);
-            }
-        });
-    }
-}
-
 // Arc's header row: every icon the same size, color and height, in one tight row. The logo, then the
 // sidebar button right next to it; back / forward / reload at the right end, against Dia's ⌄ button
 // (or against the edge, at the logo's distance, when that button is hidden).
@@ -6502,15 +6481,11 @@ static void ArcStyleHeader(ArcState& st) {
         } catch (...) {
         }
     int cols = (int)header.ColumnDefinitions().Size();
-    // Like the Mac's window buttons: the Dia logo (its app menu) stays out of sight until the pointer comes to
-    // it, and the sidebar button sits in its place meanwhile, stepping aside when it shows.
-    WatchArcLogo(st, logo, left);
     // The Mac's icon grey: about 60% of the text color, so enabled and disabled buttons keep their difference.
     for (auto el : {left, right})
         if (std::abs(el.Opacity() - 0.62) > 0.01) el.Opacity(0.62);
-    double shown = st.headerHover ? 1 : 0;
-    if (std::abs(logo.Opacity() - shown) > 0.01) HeaderSet(st, logo, mux::UIElement::OpacityProperty(), winrt::box_value(shown));
-    for (auto [el, m, ha] : {std::tuple{left, mux::Thickness{logoX + logo.ActualWidth() * shown, top, 0, 0}, mux::HorizontalAlignment::Left},
+    // Like the Mac's window buttons, the Dia logo (its app menu) always shows, with the sidebar button right after it.
+    for (auto [el, m, ha] : {std::tuple{left, mux::Thickness{logoX + logo.ActualWidth(), top, 0, 0}, mux::HorizontalAlignment::Left},
                              std::tuple{right, mux::Thickness{0, top, edge, 0}, mux::HorizontalAlignment::Right}}) {
         if (muxc::Grid::GetColumn(el) != 0) muxc::Grid::SetColumn(el, 0);
         if (cols > 1 && muxc::Grid::GetColumnSpan(el) != cols) muxc::Grid::SetColumnSpan(el, cols);
@@ -7252,7 +7227,9 @@ static void FlattenArcTiles() {
 }
 
 static void UpdateArcBar() {
-    bool on = ArcSidebarOn();
+    // With the sidebar closed its controls would go with it, the sidebar button too, leaving no way to
+    // open it again: they go back to the page's toolbar, which stays shown (UpdateHiddenToolbar).
+    bool on = ArcSidebarOn() && Ui_State(L"sidebarOpen");
     if (!on) {
         for (auto& [h, st] : t_arc) ArcOff(st);
         if (!t_arc.empty()) Log("Arc URL bar: off"), ResetCommandBars();
@@ -8942,7 +8919,7 @@ bool Ui_PeekFixedSize(HWND w) {
 
 static void UpdateHiddenToolbar() {
     bool hide = Engine_TweakOn(L"hideToolbar") || ArcSidebarOn();
-    bool show = (Engine_TweakOn(L"hideToolbar") && Engine_Hover()) ||
+    bool show = (Engine_TweakOn(L"hideToolbar") && Engine_Hover()) || (ArcSidebarOn() && !Ui_State(L"sidebarOpen")) ||
                 (Engine_TweakOn(L"showToolbarWithSidebar") && Ui_State(L"sidebarOpen")) ||
                 (Engine_TweakOn(L"showToolbarOnNewTab") && Ui_State(L"newTab"));
     bool hideAll = hide;
