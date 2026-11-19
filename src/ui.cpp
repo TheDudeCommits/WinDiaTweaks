@@ -6424,6 +6424,7 @@ static void UpdateArcLabel(ArcState& st) {
         if (auto header = st.header.get())
             if (auto ref = FindByName(header, L"OverflowButton").try_as<muxc::Control>()) color = ref.Foreground();
     if (label.Foreground() != color) label.Foreground(color);
+    if (std::abs(label.Opacity() - 0.72) > 0.01) label.Opacity(0.72);  // the Mac's softer site text
     if (label.FontFamily() != reb.FontFamily()) label.FontFamily(reb.FontFamily());
 }
 
@@ -6504,6 +6505,9 @@ static void ArcStyleHeader(ArcState& st) {
     // Like the Mac's window buttons: the Dia logo (its app menu) stays out of sight until the pointer comes to
     // it, and the sidebar button sits in its place meanwhile, stepping aside when it shows.
     WatchArcLogo(st, logo, left);
+    // The Mac's icon grey: about 60% of the text color, so enabled and disabled buttons keep their difference.
+    for (auto el : {left, right})
+        if (std::abs(el.Opacity() - 0.62) > 0.01) el.Opacity(0.62);
     double shown = st.headerHover ? 1 : 0;
     if (std::abs(logo.Opacity() - shown) > 0.01) HeaderSet(st, logo, mux::UIElement::OpacityProperty(), winrt::box_value(shown));
     for (auto [el, m, ha] : {std::tuple{left, mux::Thickness{logoX + logo.ActualWidth() * shown, top, 0, 0}, mux::HorizontalAlignment::Left},
