@@ -7232,6 +7232,25 @@ void Ui_ElementAdded(const std::wstring& name) {
     if (name == L"NavigationBarContent" || name == L"NavigationBarHost" || name == L"MinimizeButton") ScheduleToolbarLook();
 }
 
+// The Mac's pinned tiles have no outline: each tile's first border (its fill) keeps its color, not its rim.
+// Dia sets the rim again as tiles come and go, so this runs on every pass; the selected tile's own borders stay.
+static void FlattenArcTiles() {
+    for (auto h : FindNodes(L"DockHost")) {
+        auto dock = Obj<mux::FrameworkElement>(h);
+        auto canvas = dock ? FindVisual(dock, [](const mux::DependencyObject& d) { return (bool)d.try_as<muxc::Canvas>(); }).try_as<muxc::Canvas>() : nullptr;
+        if (!canvas) continue;
+        for (auto const& c : canvas.Children()) {
+            auto tile = c.try_as<muxc::UserControl>();
+            auto grid = tile ? tile.Content().try_as<muxc::Grid>() : nullptr;
+            if (!grid || grid.Children().Size() == 0) continue;
+            auto fill = grid.Children().GetAt(0).try_as<muxc::Border>();
+            if (!fill) continue;
+            auto t = fill.BorderThickness();
+            if (t.Left || t.Top || t.Right || t.Bottom) fill.BorderThickness({0, 0, 0, 0});
+        }
+    }
+}
+
 static void UpdateArcBar() {
     bool on = ArcSidebarOn();
     if (!on) {
@@ -7242,6 +7261,7 @@ static void UpdateArcBar() {
     }
     HookCommandBarPopovers();
     CheckLiftedBar();
+    FlattenArcTiles();
     for (auto h : FindNodes(L"SpacePagingRoot")) {
         auto paging = Obj<muxc::Grid>(h);
         if (!paging) continue;
