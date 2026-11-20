@@ -6055,6 +6055,21 @@ struct ArcState {
     std::vector<winrt::hstring> addressKeys;      // sidebar brushes we added to the field's resources
     std::vector<winrt::weak_ref<mux::UIElement>> noFocusRing;  // ☆ / ⋯ without a focus ring in the pill
     std::vector<std::pair<winrt::weak_ref<mux::UIElement>, int>> zSaved;  // paint order we changed (Dia's z)
+    // The Mac's capsule and site panel (UpdateArcPanel). Dia's pinned extensions stay in the page toolbar
+    // and are drawn over the pill like the field: the host, and Dia's own values for what we change.
+    winrt::weak_ref<mux::FrameworkElement> ext;
+    muxm::Transform extTransform{nullptr};
+    muxm::RectangleGeometry extClip{nullptr};
+    wf::IInspectable extTheme{nullptr};
+    double extOpacity = 1, extLeft = 0, extWidth = 0;  // (extLeft, extWidth: what the pill shows, pill coordinates)
+    bool extHit = true, panelOpen = false;
+    winrt::weak_ref<muxc::Button> panelButton;  // ours, under Dia's site button, which lets clicks through to it
+    winrt::weak_ref<mux::UIElement> site;
+    // Dia's ☆ button, out of the pill (it's in the panel, as on the Mac): Dia's own visibility, and our watch.
+    winrt::weak_ref<mux::FrameworkElement> bookmark;
+    mux::Data::BindingBase bookmarkBinding{nullptr};
+    wf::IInspectable bookmarkLocal{nullptr};
+    int64_t bookmarkToken = 0;
 };
 static thread_local std::map<InstanceHandle, ArcState> t_arc;
 
@@ -6093,7 +6108,9 @@ static bool MoveInto(ArcState& st, const mux::FrameworkElement& el, const muxc::
 }
 
 // Put the items we borrowed back into their tab's toolbar, last moved first so indexes line up.
+static void RestoreArcPanel(ArcState& st);
 static void ReturnMoved(ArcState& st) {
+    RestoreArcPanel(st);
     for (auto& [w, brush] : st.tint)
         if (auto c = w.get()) c.Foreground(brush);
     st.tint.clear();
@@ -6362,6 +6379,349 @@ static void FlushArcTrailing(ArcState& st) {
     }
 }
 
+// ---- The Mac's capsule and site panel.
+// On hover the pill shows two pinned extensions, then copy link and the site button, as Arc does; ☆ moves
+// into the panel. The site button opens a panel like Arc's Site Control Center: bookmark and copy link,
+// every pinned extension, Dia's own list of all of them, and the site's settings. Everything in it presses
+// Dia's own buttons, which stay where Dia put them, so their menus and popups open in the right place.
+static muxm::Brush ArcPillBrush(const mux::FrameworkElement& pill, bool hovered);
+
+static void RestoreArcPanel(ArcState& st) {
+    if (auto e = st.ext.get()) {
+        e.RenderTransform(st.extTransform);
+        e.Clip(st.extClip);
+        e.Opacity(st.extOpacity);
+        e.IsHitTestVisible(st.extHit);
+        if (st.extTheme && st.extTheme != mux::DependencyProperty::UnsetValue()) e.SetValue(mux::FrameworkElement::RequestedThemeProperty(), st.extTheme);
+        else e.ClearValue(mux::FrameworkElement::RequestedThemeProperty());
+    }
+    st.ext = nullptr;
+    st.extWidth = 0;
+    if (auto s = st.site.get()) s.IsHitTestVisible(true);
+    st.site = nullptr;
+    if (auto b = st.bookmark.get()) {
+        b.UnregisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), st.bookmarkToken);
+        if (st.bookmarkBinding) b.SetBinding(mux::UIElement::VisibilityProperty(), st.bookmarkBinding);
+        else if (st.bookmarkLocal && st.bookmarkLocal != mux::DependencyProperty::UnsetValue()) b.SetValue(mux::UIElement::VisibilityProperty(), st.bookmarkLocal);
+        else b.ClearValue(mux::UIElement::VisibilityProperty());
+    }
+    st.bookmark = nullptr;
+    st.bookmarkBinding = nullptr;
+    st.bookmarkLocal = nullptr;
+    if (auto p = st.panelButton.get()) p.Visibility(mux::Visibility::Collapsed);
+}
+
+// Presses one of Dia's buttons once our panel has closed, so whatever it opens isn't closed with it.
+static void PressLater(const muxc::Button& b) {
+    if (!b) return;
+    auto weak = winrt::make_weak(b);
+    if (auto q = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread())
+        q.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [weak] {
+            if (auto b = weak.get()) try {
+                    winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(b).Invoke();
+                } catch (...) {
+                }
+        });
+}
+
+static mux::FrameworkElement ArcToolbarOf(const mux::FrameworkElement& address) {
+    for (mux::DependencyObject d = address; d; d = muxm::VisualTreeHelper::GetParent(d))
+        if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"NavigationBarHost") return fe;
+    return nullptr;
+}
+
+static std::vector<muxc::Button> PinnedExtensionButtons(const mux::FrameworkElement& ext) {
+    std::vector<muxc::Button> out;
+    auto repeater = ext ? FindByName(ext, L"PinnedExtensionsRepeater") : nullptr;
+    if (!repeater) return out;
+    for (int i = 0, n = muxm::VisualTreeHelper::GetChildrenCount(repeater); i < n; i++)
+        if (auto b = muxm::VisualTreeHelper::GetChild(repeater, i).try_as<muxc::Button>();
+            b && b.Visibility() == mux::Visibility::Visible && b.ActualWidth() > 0)
+            out.push_back(b);
+    std::sort(out.begin(), out.end(), [&](const muxc::Button& a, const muxc::Button& b) {
+        try {
+            return a.TransformToVisual(repeater).TransformPoint({0, 0}).X < b.TransformToVisual(repeater).TransformPoint({0, 0}).X;
+        } catch (...) {
+            return false;
+        }
+    });
+    return out;
+}
+
+static muxc::Button ArcTile(const winrt::hstring& name, const mux::UIElement& icon, bool row, std::function<void()> run,
+                            const mux::FrameworkElement& theme) {
+    muxc::Button b;
+    b.HorizontalAlignment(mux::HorizontalAlignment::Stretch);
+    b.HorizontalContentAlignment(row ? mux::HorizontalAlignment::Left : mux::HorizontalAlignment::Center);
+    b.Height(row ? 32 : 38);
+    b.Padding(row ? mux::Thickness{10, 0, 10, 0} : mux::Thickness{0, 0, 0, 0});
+    b.BorderThickness({0, 0, 0, 0});
+    b.CornerRadius({row ? 7.0 : 9.0, row ? 7.0 : 9.0, row ? 7.0 : 9.0, row ? 7.0 : 9.0});
+    if (row) b.Background(muxm::SolidColorBrush(Rgba(0, 0, 0, 0)));
+    else b.Background(ArcPillBrush(theme, false));
+    if (row) {
+        muxc::StackPanel line;
+        line.Orientation(muxc::Orientation::Horizontal);
+        line.Spacing(10);
+        line.Children().Append(icon);
+        muxc::TextBlock text;
+        text.Text(name);
+        text.FontSize(13);
+        text.VerticalAlignment(mux::VerticalAlignment::Center);
+        line.Children().Append(text);
+        b.Content(line);
+    } else {
+        b.Content(icon);
+        muxc::ToolTipService::SetToolTip(b, winrt::box_value(name));
+    }
+    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(b, name);
+    b.Click([run](auto&&, auto&&) { run(); });
+    return b;
+}
+
+static mux::UIElement ArcGlyph(const wchar_t* glyph) {
+    muxc::FontIcon icon;
+    icon.Glyph(glyph);
+    icon.FontSize(16);
+    icon.FontFamily(muxm::FontFamily(L"Segoe Fluent Icons,Segoe MDL2 Assets"));
+    return icon;
+}
+
+// Tiles four to a row, as in Arc's panel.
+static muxc::Grid ArcGrid(const std::vector<muxc::Button>& tiles) {
+    muxc::Grid grid;
+    grid.ColumnSpacing(6);
+    grid.RowSpacing(6);
+    for (int c = 0; c < 4; c++) {
+        muxc::ColumnDefinition cd;
+        cd.Width({1, mux::GridUnitType::Star});
+        grid.ColumnDefinitions().Append(cd);
+    }
+    for (size_t r = 0; r < (tiles.size() + 3) / 4; r++) {
+        muxc::RowDefinition rd;
+        rd.Height(mux::GridLengthHelper::Auto());
+        grid.RowDefinitions().Append(rd);
+    }
+    for (size_t i = 0; i < tiles.size(); i++) {
+        muxc::Grid::SetColumn(tiles[i], (int)(i % 4));
+        muxc::Grid::SetRow(tiles[i], (int)(i / 4));
+        grid.Children().Append(tiles[i]);
+    }
+    return grid;
+}
+
+static muxc::TextBlock ArcHeading(const wchar_t* text) {
+    muxc::TextBlock t;
+    t.Text(text);
+    t.FontSize(13);
+    t.FontWeight(winrt::Microsoft::UI::Text::FontWeights::SemiBold());
+    t.Foreground(BrushRes(L"TextFillColorSecondaryBrush", Rgba(0xc5, 0xc5, 0xc5)));
+    return t;
+}
+
+static void UpdateArcPanel(ArcState& st);
+static void ShowArcPanel(ArcState& st, const muxc::Button& anchor) {
+    auto host = ArcHost(st);
+    auto ext = st.ext.get();
+    auto copy = host ? FindByName(host, L"CopyLinkButton").try_as<muxc::Button>() : nullptr;
+    auto site = host ? FindByName(host, L"SiteMenuButton").try_as<muxc::Button>() : nullptr;
+    auto all = ext ? FindByName(ext, L"OverflowButton").try_as<muxc::Button>() : nullptr;
+    muxc::Flyout flyout;
+    auto weakFlyout = winrt::make_weak(flyout);
+    auto then = [weakFlyout](std::function<void()> f) {
+        return [weakFlyout, f] {
+            if (auto fl = weakFlyout.get()) fl.Hide();
+            f();
+        };
+    };
+    auto press = [](const muxc::Button& b) { return [w = winrt::make_weak(b)] { PressLater(w.get()); }; };
+    mux::FrameworkElement theme = anchor;
+
+    std::vector<muxc::Button> actions;
+    // Dia's ☆ is out of the pill; Ctrl+D is the same command (Bookmark this page).
+    actions.push_back(ArcTile(L"Bookmark this page", ArcGlyph(L"\xE734"), false, then([] {
+        if (auto q = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread())
+            q.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [] {
+                INPUT in[4] = {};
+                for (auto& i : in) i.type = INPUT_KEYBOARD;
+                in[0].ki.wVk = VK_CONTROL;
+                in[1].ki.wVk = 'D';
+                in[2].ki.wVk = 'D';
+                in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+                in[3].ki.wVk = VK_CONTROL;
+                in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+                SendInput(4, in, sizeof(INPUT));
+            });
+    }), theme));
+    if (copy) actions.push_back(ArcTile(L"Copy link", ArcGlyph(L"\xE71B"), false, then(press(copy)), theme));
+    if (site) actions.push_back(ArcTile(L"Site settings", ArcGlyph(L"\xE713"), false, then(press(site)), theme));
+    if (all) actions.push_back(ArcTile(L"Show all extensions", ArcGlyph(L"\xEA86"), false, then(press(all)), theme));
+
+    std::vector<muxc::Button> extensions;
+    for (auto& b : PinnedExtensionButtons(ext)) {
+        muxc::Image icon;
+        icon.Width(16);
+        icon.Height(16);
+        if (auto img = FindVisual(b, [](const mux::DependencyObject& d) { return (bool)d.try_as<muxc::Image>(); }).try_as<muxc::Image>())
+            icon.Source(img.Source());
+        auto name = winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::GetName(b);
+        extensions.push_back(ArcTile(name, icon, false, then(press(b)), theme));
+    }
+    if (all) extensions.push_back(ArcTile(L"All extensions", ArcGlyph(L"\xE712"), false, then(press(all)), theme));
+
+    muxc::StackPanel root;
+    root.Width(236);
+    root.Spacing(10);
+    root.Children().Append(ArcGrid(actions));
+    if (!extensions.empty()) {
+        auto h = ArcHeading(L"Extensions");
+        h.Margin({0, 6, 0, 0});
+        root.Children().Append(h);
+        root.Children().Append(ArcGrid(extensions));
+    }
+    if (site) {
+        auto h = ArcHeading(L"Settings");
+        h.Margin({0, 6, 0, 0});
+        root.Children().Append(h);
+        root.Children().Append(ArcTile(L"Site settings", ArcGlyph(L"\xE713"), true, then(press(site)), theme));
+    }
+    flyout.Content(root);
+    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(root, L"Site panel");
+    muxc::Primitives::FlyoutShowOptions opts;
+    opts.Placement(muxc::Primitives::FlyoutPlacementMode::BottomEdgeAlignedRight);
+    // Kept over the pill while the panel is open (the pointer has left the pill for it).
+    st.panelOpen = true;
+    flyout.Closed([w = winrt::make_weak(anchor)](auto&&, auto&&) {
+        for (auto& [h, s] : t_arc)
+            if (s.panelButton.get() == w.get()) s.panelOpen = false, UpdateArcPanel(s);
+    });
+    flyout.ShowAt(anchor, opts);
+    Log("arc: site panel (%u extensions)", (unsigned)extensions.size());
+}
+
+static void UpdateArcPanel(ArcState& st) {
+    auto url = st.url.get().try_as<mux::FrameworkElement>();
+    auto host = ArcHost(st);
+    if (!url || !host || host != st.address.get() || url.ActualWidth() <= 0) return;  // (only once the field is drawn over the pill)
+    auto trailing = FindByName(host, L"UrlBarTrailingStack");
+    auto site = FindByName(host, L"SiteMenuButton");
+    auto bookmark = FindByName(host, L"BookmarkButton");
+    auto toolbar = ArcToolbarOf(host);
+    auto ext = toolbar ? FindByName(toolbar, L"PinnedExtensionsHost") : nullptr;
+    if (!trailing || !site) return;
+
+    // ☆ goes to the panel.
+    if (bookmark && st.bookmark.get() != bookmark) {
+        if (auto old = st.bookmark.get()) old.UnregisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), st.bookmarkToken);
+        st.bookmark = winrt::make_weak(bookmark);
+        st.bookmarkBinding = nullptr;
+        if (auto be = bookmark.GetBindingExpression(mux::UIElement::VisibilityProperty())) st.bookmarkBinding = be.ParentBinding();
+        st.bookmarkLocal = bookmark.ReadLocalValue(mux::UIElement::VisibilityProperty());
+        bookmark.Visibility(mux::Visibility::Collapsed);
+        st.bookmarkToken = bookmark.RegisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), [](mux::DependencyObject const& o, auto&&) {
+            if (auto u = o.try_as<mux::UIElement>(); u && ArcSidebarOn() && u.Visibility() != mux::Visibility::Collapsed) u.Visibility(mux::Visibility::Collapsed);
+        });
+    }
+
+    // The site button: ours takes its clicks (Dia's lets them through, its icon stays on top) and opens the panel.
+    auto button = st.panelButton.get();
+    if (!button) {
+        button = muxc::Button{};
+        button.Name(L"diatweaksArcPanelButton");
+        button.Padding({0, 0, 0, 0});
+        button.BorderThickness({0, 0, 0, 0});
+        button.Background(muxm::SolidColorBrush(Rgba(0, 0, 0, 0)));
+        button.HorizontalAlignment(mux::HorizontalAlignment::Left);
+        button.VerticalAlignment(mux::VerticalAlignment::Top);
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(button, L"Site controls");
+        muxc::ToolTipService::SetToolTip(button, winrt::box_value(L"Site controls"));
+        button.Click([](wf::IInspectable const& sender, auto&&) {
+            for (auto& [h, s] : t_arc)
+                if (s.panelButton.get() == sender.try_as<muxc::Button>()) ShowArcPanel(s, sender.as<muxc::Button>());
+        });
+        if (auto pill = st.url.get()) pill.Children().Append(button);
+        st.panelButton = winrt::make_weak(button);
+    }
+    if (st.site.get() != site) {
+        if (auto old = st.site.get()) old.IsHitTestVisible(true);
+        st.site = winrt::make_weak(site.as<mux::UIElement>());
+    }
+    if (site.IsHitTestVisible()) site.IsHitTestVisible(false);
+    try {
+        auto r = site.TransformToVisual(url).TransformBounds({0, 0, (float)site.ActualWidth(), (float)site.ActualHeight()});
+        mux::Thickness m{r.X, r.Y, 0, 0};
+        auto c = button.Margin();
+        if (std::abs(c.Left - m.Left) > 0.25 || std::abs(c.Top - m.Top) > 0.25) button.Margin(m);
+        if (std::abs(button.Width() - r.Width) > 0.25 || std::isnan(button.Width())) button.Width(r.Width);
+        if (std::abs(button.Height() - r.Height) > 0.25 || std::isnan(button.Height())) button.Height(r.Height);
+        if (auto sb = site.try_as<muxc::Control>(); sb && button.CornerRadius() != sb.CornerRadius()) button.CornerRadius(sb.CornerRadius());
+    } catch (...) {
+    }
+    auto want = st.hover || st.panelOpen ? mux::Visibility::Visible : mux::Visibility::Collapsed;
+    if (button.Visibility() != want) button.Visibility(want);
+
+    // Two pinned extensions just before the trailing buttons, under the pointer.
+    if (st.ext.get() != ext) {
+        if (auto old = st.ext.get()) {
+            old.RenderTransform(st.extTransform);
+            old.Clip(st.extClip);
+            old.Opacity(st.extOpacity);
+            old.IsHitTestVisible(st.extHit);
+        }
+        st.ext = nullptr;
+        st.extWidth = 0;
+        if (ext) {
+            st.ext = winrt::make_weak(ext);
+            st.extTransform = ext.RenderTransform();
+            st.extClip = ext.Clip();
+            st.extOpacity = ext.Opacity();
+            st.extHit = ext.IsHitTestVisible();
+            st.extTheme = ext.ReadLocalValue(mux::FrameworkElement::RequestedThemeProperty());
+        }
+    }
+    if (!ext || ext.ActualWidth() <= 0) return;
+    if (ext.RequestedTheme() != url.ActualTheme()) ext.RequestedTheme(url.ActualTheme());
+    auto buttons = PinnedExtensionButtons(ext);
+    double width = 0;
+    try {
+        size_t n = (std::min)((size_t)2, buttons.size());
+        double room = 0;
+        // Only as many as leave the site some room.
+        double trailingLeft = trailing.TransformToVisual(url).TransformPoint({0, 0}).X;
+        for (auto const& c : trailing.as<muxc::Panel>().Children())
+            if (auto b = c.try_as<mux::FrameworkElement>(); b && b.Visibility() == mux::Visibility::Visible && b.ActualWidth() > 0) {
+                trailingLeft = b.TransformToVisual(url).TransformPoint({0, 0}).X;
+                break;
+            }
+        room = trailingLeft - 2 - 80;
+        while (n > 0) {
+            auto& last = buttons[n - 1];
+            width = last.TransformToVisual(ext).TransformPoint({(float)last.ActualWidth(), 0}).X;
+            if (width <= room) break;
+            n--, width = 0;
+        }
+        if (n == 0) width = 0;
+        auto move = ext.RenderTransform().try_as<muxm::TranslateTransform>();
+        if (!move || move == st.extTransform) move = muxm::TranslateTransform{}, ext.RenderTransform(move);
+        auto at = ext.TransformToVisual(url).TransformPoint({0, 0});
+        double x = trailingLeft - 2 - width, y = (url.ActualHeight() - ext.ActualHeight()) / 2;
+        if (std::abs(at.X - x) > 0.25) move.X(move.X() + x - at.X);
+        if (std::abs(at.Y - y) > 0.25) move.Y(move.Y() + y - at.Y);
+        auto clip = ext.Clip();
+        if (!clip || clip == st.extClip || std::abs(clip.Rect().Width - width) > 0.25 || std::abs(clip.Rect().Height - ext.ActualHeight()) > 0.25) {
+            muxm::RectangleGeometry g;
+            g.Rect({0, 0, (float)width, (float)ext.ActualHeight()});
+            ext.Clip(g);
+        }
+        st.extLeft = x;
+    } catch (...) {
+    }
+    st.extWidth = width;
+    bool show = st.hover && width > 0;
+    if (ext.Opacity() != (show ? 1 : 0)) ext.Opacity(show ? 1 : 0);
+    if (ext.IsHitTestVisible() != show) ext.IsHitTestVisible(show);
+}
+
 static void AttachDisplay(ArcState& st, const mux::FrameworkElement& address);
 static void UpdateArcLabel(ArcState& st) {
     auto label = st.label.get();
@@ -6410,6 +6770,8 @@ static void UpdateArcLabel(ArcState& st) {
             right = 12;  // buttons hidden: the site can use the whole pill
         else if (trailing && trailing.ActualWidth() > 0)
             right = url.as<mux::FrameworkElement>().ActualWidth() - trailing.TransformToVisual(url).TransformPoint({0, 0}).X + 4;
+        if (st.hover && st.extWidth > 0)  // and clear of the extensions before them
+            right = (std::max)(right, url.as<mux::FrameworkElement>().ActualWidth() - st.extLeft + 4);
         else
             right = label.Margin().Right > 0 ? label.Margin().Right : right;  // not measured yet: keep it put
     } catch (...) {
@@ -7260,6 +7622,7 @@ static void UpdateArcBar() {
         }
         UpdateArcTrailing(st, !st.swapped);
         FlushArcTrailing(st);
+        UpdateArcPanel(st);
         UpdateArcLabel(st);
         ArcStyleHeader(st);
         if (st.swapped) st.swapped = false, UpdateAddressField();
