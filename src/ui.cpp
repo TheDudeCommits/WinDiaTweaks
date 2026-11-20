@@ -8923,7 +8923,10 @@ bool Ui_PeekFixedSize(HWND w) {
 
 static void UpdateHiddenToolbar() {
     bool hide = Engine_TweakOn(L"hideToolbar") || ArcSidebarOn();
-    bool show = (Engine_TweakOn(L"hideToolbar") && Engine_Hover()) || (ArcSidebarOn() && !Ui_State(L"sidebarOpen")) ||
+    // With the sidebar closed, its controls are back in the toolbar: it stays hidden, as on the Mac, and
+    // slides in when the pointer reaches the window's top, so the sidebar button is always within reach.
+    bool reveal = Engine_TweakOn(L"hideToolbar") || (ArcSidebarOn() && !Ui_State(L"sidebarOpen"));
+    bool show = (reveal && Engine_Hover()) ||
                 (Engine_TweakOn(L"showToolbarWithSidebar") && Ui_State(L"sidebarOpen")) ||
                 (Engine_TweakOn(L"showToolbarOnNewTab") && Ui_State(L"newTab"));
     bool hideAll = hide;

@@ -761,7 +761,7 @@ static VOID CALLBACK TimerProc(HWND, UINT, UINT_PTR, DWORD) {
         reevaluate = true;
     }
     bool stateChanged = Ui_Tick();
-    g_watchHover = RulesUseState() || TweakOn(L"hideToolbar");
+    g_watchHover = RulesUseState() || TweakOn(L"hideToolbar") || TweakOn(L"arcUrlBar");  // (arcUrlBar: its toolbar shows on hover while the sidebar is closed)
     if (reevaluate) EvaluateThread();
     else if (stateChanged) EvaluateStateNodes(), Ui_StateApplied();
     if (g_dumpPending.exchange(false)) {
