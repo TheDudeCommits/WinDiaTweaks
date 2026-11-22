@@ -352,6 +352,59 @@ static void RunProbe() {
             o << Tidy_PromptText() << '\n';
             continue;
         }
+        if (nm == L"TILES" || nm == L"LIST") {  // the row probes after this act on the dock's tiles (TILES) or the list's rows (LIST)
+            extern void Tabs_DebugUseTiles(bool on);
+            Tabs_DebugUseTiles(nm == L"TILES");
+            continue;
+        }
+        if (nm == L"MENU" || nm.rfind(L"MENUPRESS:", 0) == 0) {  // menus open now (listed; with MENUPRESS:Text_with_underscores, that item pressed)
+            extern void Tabs_DebugOpenMenus(std::ostringstream & o, const std::wstring& press);
+            std::wstring press = nm == L"MENU" ? L"" : nm.substr(10);
+            for (auto& ch : press)
+                if (ch == L'_') ch = L' ';
+            Tabs_DebugOpenMenus(o, press);
+            continue;
+        }
+        if (nm == L"PINSTATE") {
+            extern std::string Pin_DebugState();
+            o << Pin_DebugState();
+            continue;
+        }
+        if (nm.rfind(L"ROWBTN:", 0) == 0) {
+            extern std::string Pin_DebugPressRowButton(int index, const std::wstring& name);
+            auto colon = nm.find(L':', 7);
+            std::wstring bn = colon == std::wstring::npos ? L"" : nm.substr(colon + 1);
+            for (auto& ch : bn)
+                if (ch == L'_') ch = L' ';
+            o << Pin_DebugPressRowButton(_wtoi(nm.c_str() + 7), bn);
+            continue;
+        }
+        if (nm == L"ROWS") {  // every tab row: pinned or not, title, buttons, automation peer
+            extern std::string Tabs_DebugRows();
+            o << Tabs_DebugRows();
+            continue;
+        }
+        if (nm.rfind(L"ROWMENU:", 0) == 0 || nm.rfind(L"ROWITEM:", 0) == 0 || nm.rfind(L"ROWRMENU:", 0) == 0 ||
+            nm.rfind(L"ROWRITEM:", 0) == 0) {  // a row's right-click menu (listed, or one item pressed); R: by a real right-click
+            extern std::string Tabs_DebugRowMenu(int index, const std::wstring& press, bool mouse);
+            bool mouse = nm[3] == L'R';
+            size_t start = mouse ? 9 : 8;
+            int idx = _wtoi(nm.c_str() + start);
+            std::wstring press;
+            if (nm[mouse ? 4 : 3] == L'I') {
+                auto colon = nm.find(L':', start);
+                if (colon != std::wstring::npos) press = nm.substr(colon + 1);
+                for (auto& ch : press)
+                    if (ch == L'_') ch = L' ';
+            }
+            o << Tabs_DebugRowMenu(idx, press, mouse);
+            continue;
+        }
+        if (nm.rfind(L"ROWSELECT:", 0) == 0) {
+            extern std::string Tabs_DebugRowSelect(int index);
+            o << Tabs_DebugRowSelect(_wtoi(nm.c_str() + 10));
+            continue;
+        }
         if (nm == L"FLYOUTS") {  // elements with a right-click menu, and what's in them
             extern std::string Tidy_DebugFlyouts();
             o << Tidy_DebugFlyouts();
@@ -4204,6 +4257,264 @@ std::string Tidy_DebugFlyouts() {  // (`diatweaks probe FLYOUTS`: elements with 
     return o.str();
 }
 
+// --- Debug probes for tab rows (`diatweaks probe ROWS`, `ROWMENU:i`, `ROWITEM:i:Text_with_underscores`,
+// `ROWSELECT:i`): what each row is and holds, and its right-click menu. Menus open through the row's
+// automation peer (as a screen reader's "show context menu"), never the pointer; their items go to
+// probe2.out a moment later, since Dia builds and opens the menu after the request returns.
+static std::string RowTitle(const mux::FrameworkElement& row) {
+    std::string t;
+    FirstIn(row, [&](const mux::FrameworkElement& fe) {
+        if (auto tb = fe.try_as<muxc::TextBlock>(); tb && !tb.Text().empty()) {
+            if (!t.empty()) t += " | ";
+            t += N(std::wstring(tb.Text()));
+        }
+        return false;
+    });
+    return t;
+}
+
+static bool RowIsPinned(const mux::FrameworkElement& row) {
+    for (auto h : FindNodes(L"TabSeparatorRow")) {
+        auto sep = Obj<mux::FrameworkElement>(h);
+        auto list = sep ? muxm::VisualTreeHelper::GetParent(sep).try_as<muxc::StackPanel>() : nullptr;
+        if (!list || list.ActualHeight() <= 0) continue;
+        for (auto const& child : list.Children()) {
+            if (child == sep) break;
+            auto top = child.try_as<mux::FrameworkElement>();
+            if (top && (top == row || FirstIn(top, [&](const mux::FrameworkElement& fe) { return fe == row; }))) return true;
+        }
+    }
+    return false;
+}
+
+static void AppendProbe2(const std::string& s) {
+    std::ofstream out(Engine_Dir() + L"\\probe2.out", std::ios::app);
+    out << s;
+}
+
+static void DescribeMenus(std::ostringstream& o, const mux::XamlRoot& root, const winrt::hstring& press, bool keepOpen = false) {
+    namespace ap = winrt::Microsoft::UI::Xaml::Automation;
+    for (auto const& popup : muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(root)) {
+        auto child = popup.Child().try_as<mux::FrameworkElement>();
+        o << "popup child=" << (child ? N(std::wstring(winrt::get_class_name(child))) : "?") << "\n";
+        if (!child) continue;
+        muxc::MenuFlyoutItem hit{nullptr};
+        std::function<void(mux::DependencyObject, int)> walk = [&](mux::DependencyObject d, int depth) {
+            if (depth > 30) return;
+            if (auto sub = d.try_as<muxc::MenuFlyoutSubItem>()) {
+                o << "  sub [" << N(std::wstring(sub.Text())) << "] (" << sub.Items().Size() << " items:";
+                for (auto const& it : sub.Items())
+                    if (auto mi = it.try_as<muxc::MenuFlyoutItem>()) o << " [" << N(std::wstring(mi.Text())) << "]";
+                o << ")\n";
+            } else if (auto mi = d.try_as<muxc::MenuFlyoutItem>()) {
+                o << "  item [" << N(std::wstring(mi.Text())) << "] " << N(std::wstring(winrt::get_class_name(mi)))
+                  << (mi.IsEnabled() ? "" : " disabled");
+                if (auto c = mi.Command()) o << " command=" << N(std::wstring(winrt::get_class_name(c)));
+                if (auto a = mi.KeyboardAcceleratorTextOverride(); !a.empty()) o << " keys=" << N(std::wstring(a));
+                for (auto const& ka : mi.KeyboardAccelerators()) o << " ka=" << (int)ka.Modifiers() << "+" << (int)ka.Key();
+                if (auto ai = ap::AutomationProperties::GetAutomationId(mi); !ai.empty()) o << " aid=" << N(std::wstring(ai));
+                o << "\n";
+                if (!press.empty() && mi.Text() == press) hit = mi;
+            } else if (auto sep = d.try_as<muxc::MenuFlyoutSeparator>()) {
+                o << "  ----\n";
+            } else if (auto fe = d.try_as<mux::FrameworkElement>(); fe && depth < 6) {
+                o << "  (" << N(std::wstring(winrt::get_class_name(fe))) << " \"" << N(std::wstring(fe.Name())) << "\")\n";
+            }
+            int n = muxm::VisualTreeHelper::GetChildrenCount(d);
+            for (int i = 0; i < n; i++) walk(muxm::VisualTreeHelper::GetChild(d, i), depth + 1);
+        };
+        walk(child, 0);
+        if (hit) {
+            o << "pressing [" << N(std::wstring(press)) << "]\n";
+            try {
+                winrt::Microsoft::UI::Xaml::Automation::Peers::MenuFlyoutItemAutomationPeer(hit).Invoke();
+            } catch (winrt::hresult_error const& e) {
+                o << "press failed 0x" << std::hex << (unsigned long)e.code() << std::dec << "\n";
+            }
+        } else if (!press.empty()) {
+            o << "no item [" << N(std::wstring(press)) << "]\n";
+        }
+        if (!keepOpen && popup.IsOpen() && (press.empty() || !hit)) popup.IsOpen(false);
+    }
+}
+
+// The dock's tiles (pinned tabs shown as tiles at the top of the sidebar): UserControls on DockHost's canvas.
+static std::vector<mux::FrameworkElement> AllDockTiles() {
+    std::vector<mux::FrameworkElement> out;
+    for (auto h : FindNodes(L"DockHost")) {
+        auto dock = Obj<mux::FrameworkElement>(h);
+        auto canvas = dock && dock.ActualHeight() > 0 ? FindVisual(dock, [](const mux::DependencyObject& d) { return (bool)d.try_as<muxc::Canvas>(); }).try_as<muxc::Canvas>() : nullptr;
+        if (!canvas) continue;
+        for (auto const& c : canvas.Children())
+            if (auto uc = c.try_as<muxc::UserControl>(); uc && uc.ActualWidth() > 0) out.push_back(uc);
+    }
+    return out;
+}
+static thread_local bool t_debugTiles = false;  // the row probes act on the dock's tiles instead
+static std::vector<mux::FrameworkElement> DebugTargets() { return t_debugTiles ? AllDockTiles() : AllTabRows(); }
+void Tabs_DebugUseTiles(bool on) { t_debugTiles = on; }
+std::vector<mux::FrameworkElement> Tabs_DebugTargets() { return DebugTargets(); }
+
+void Tabs_DebugOpenMenus(std::ostringstream& o, const std::wstring& press) {
+    for (auto h : FindNodes(L"SidebarBorder"))
+        if (auto any = Obj<mux::FrameworkElement>(h); any && any.XamlRoot()) {
+            DescribeMenus(o, any.XamlRoot(), winrt::hstring(press), press.empty());
+            return;
+        }
+}
+
+std::string Tabs_DebugRows() {
+    namespace ap = winrt::Microsoft::UI::Xaml::Automation;
+    namespace peers = winrt::Microsoft::UI::Xaml::Automation::Peers;
+    std::ostringstream o;
+    int i = 0;
+    for (auto& row : DebugTargets()) {
+        auto uc = row.as<muxc::UserControl>();
+        auto g = uc.Content().try_as<muxc::Grid>();
+        o << "row " << i++ << (RowIsPinned(row) ? " PINNED" : "") << " " << N(std::wstring(winrt::get_class_name(row)))
+          << " h=" << row.ActualHeight() << " \"" << RowTitle(row) << "\"";
+        try {
+            auto at = row.TransformToVisual(nullptr).TransformPoint({0, 0});
+            o << " at=" << at.X << "," << at.Y << " vis=" << (row.Visibility() == mux::Visibility::Visible ? "V" : "C") << " op=" << row.Opacity();
+            if (auto tt = muxc::ToolTipService::GetToolTip(row))
+                if (auto ts = tt.try_as<wf::IReference<winrt::hstring>>()) o << " tip=\"" << N(std::wstring(ts.Value())) << "\"";
+            auto an = winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::GetName(row);
+            if (!an.empty()) o << " aname=\"" << N(std::wstring(an)) << "\"";
+        } catch (...) {
+        }
+        if (auto dc = row.DataContext()) o << " dc=" << N(std::wstring(winrt::get_class_name(dc)));
+        if (auto cf = row.ContextFlyout()) o << " contextflyout=" << N(std::wstring(winrt::get_class_name(cf)));
+        if (g)
+            for (auto const& c : g.Children())
+                if (auto b = c.try_as<muxc::Button>())
+                    o << " btn[" << N(std::wstring(ap::AutomationProperties::GetName(b))) << (b.Visibility() == mux::Visibility::Visible ? "" : ",C") << "]";
+        int up = 0;
+        for (auto a = muxm::VisualTreeHelper::GetParent(row); a && up < 4; a = muxm::VisualTreeHelper::GetParent(a), up++) {
+            auto fe = a.try_as<mux::FrameworkElement>();
+            o << " ^" << N(std::wstring(winrt::get_class_name(a))) << (fe && !fe.Name().empty() ? "\"" + N(std::wstring(fe.Name())) + "\"" : "");
+            try {
+                if (auto ue = a.try_as<mux::UIElement>())
+                    if (auto ap2 = peers::FrameworkElementAutomationPeer::CreatePeerForElement(ue)) o << "(peer " << N(std::wstring(winrt::get_class_name(ap2))) << ")";
+            } catch (...) {
+            }
+        }
+        try {
+            auto p = peers::FrameworkElementAutomationPeer::CreatePeerForElement(row);
+            if (!p) {
+                o << " nopeer\n";
+                continue;
+            }
+            o << " peer=" << N(std::wstring(winrt::get_class_name(p))) << " ctl=" << (int)p.GetAutomationControlType()
+              << " name=\"" << N(std::wstring(p.GetName())) << "\" patterns=";
+            using PI = peers::PatternInterface;
+            std::pair<PI, const char*> pats[] = {{PI::Invoke, "Invoke"},     {PI::SelectionItem, "SelectionItem"}, {PI::ExpandCollapse, "ExpandCollapse"},
+                                                 {PI::Toggle, "Toggle"},     {PI::Value, "Value"},                 {PI::ScrollItem, "ScrollItem"},
+                                                 {PI::Selection, "Selection"}, {PI::ItemContainer, "ItemContainer"}, {PI::VirtualizedItem, "VirtualizedItem"}};
+            for (auto& [pi, nm] : pats)
+                if (p.GetPattern(pi)) o << nm << ",";
+        } catch (...) {
+        }
+        o << "\n";
+    }
+    return o.str();
+}
+
+// ROWMENU:i (press empty) lists row i's right-click menu and closes it; with press, invokes that item.
+static HWND TopWindowFor(const mux::XamlRoot& root);
+
+std::string Tabs_DebugRowMenu(int index, const std::wstring& press, bool mouse) {
+    auto rows = DebugTargets();
+    if (index < 0 || index >= (int)rows.size()) return "no row " + std::to_string(index) + "\n";
+    auto row = rows[index];
+    std::string head = "row " + std::to_string(index) + " \"" + RowTitle(row) + "\" pinned=" + (RowIsPinned(row) ? "1" : "0") + "\n";
+    if (mouse) {  // a real right-click on the row's middle, then the pointer goes back
+        HWND top = row.XamlRoot() ? TopWindowFor(row.XamlRoot()) : nullptr;
+        if (!top) return head + "no window\n";
+        double scale = row.XamlRoot().RasterizationScale();
+        auto o = row.TransformToVisual(nullptr).TransformPoint({0, 0});
+        POINT at{(LONG)std::lround((o.X + row.ActualWidth() / 2) * scale), (LONG)std::lround((o.Y + row.ActualHeight() / 2) * scale)};
+        ClientToScreen(top, &at);
+        POINT back;
+        GetCursorPos(&back);
+        SetCursorPos(at.x, at.y);
+        INPUT in[2] = {};
+        in[0].type = in[1].type = INPUT_MOUSE;
+        in[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+        in[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+        SendInput(2, in, sizeof(INPUT));
+        auto w = winrt::make_weak(row);
+        auto t = row.DispatcherQueue().CreateTimer();
+        t.Interval(std::chrono::milliseconds(150));
+        t.IsRepeating(false);
+        t.Tick([back](auto const& tt, auto&&) { tt.Stop(), SetCursorPos(back.x, back.y); });
+        t.Start();
+        static thread_local std::vector<winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer> keepBack;
+        keepBack.push_back(t);
+        if (keepBack.size() > 4) keepBack.erase(keepBack.begin());
+        char b[96];
+        sprintf_s(b, "right-clicked at %ld,%ld\n", at.x, at.y);
+        head += b;
+    } else try {
+        namespace peers = winrt::Microsoft::UI::Xaml::Automation::Peers;
+        auto p = peers::FrameworkElementAutomationPeer::CreatePeerForElement(row);
+        if (!p) p = peers::FrameworkElementAutomationPeer(row);
+        head += "peer " + N(std::wstring(winrt::get_class_name(p))) + "\n";
+        p.ShowContextMenu();
+    } catch (winrt::hresult_error const& e) {
+        char b[64];
+        sprintf_s(b, "ShowContextMenu 0x%08lx\n", (unsigned long)e.code());
+        return head + b;
+    }
+    auto weak = winrt::make_weak(row);
+    auto timer = row.DispatcherQueue().CreateTimer();
+    timer.Interval(std::chrono::milliseconds(600));
+    timer.IsRepeating(false);
+    winrt::hstring p(press);
+    timer.Tick([weak, head, p](auto const& t, auto&&) {
+        t.Stop();
+        std::ostringstream o;
+        o << head;
+        try {
+            if (auto r = weak.get(); r && r.XamlRoot()) DescribeMenus(o, r.XamlRoot(), p);
+            else o << "row gone\n";
+        } catch (...) {
+            o << "describe failed\n";
+        }
+        AppendProbe2(o.str());
+    });
+    timer.Start();
+    static thread_local std::vector<winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer> keep;
+    keep.push_back(timer);
+    if (keep.size() > 8) keep.erase(keep.begin());
+    return head + "menu requested; items go to probe2.out\n";
+}
+
+// ROWSELECT:i: selects (opens) row i as a click would, through its automation peer.
+std::string Tabs_DebugRowSelect(int index) {
+    namespace peers = winrt::Microsoft::UI::Xaml::Automation::Peers;
+    auto rows = DebugTargets();
+    if (index < 0 || index >= (int)rows.size()) return "no row\n";
+    try {
+        mux::UIElement el = rows[index];
+        auto p = peers::FrameworkElementAutomationPeer::CreatePeerForElement(el);
+        for (int up = 0; !p && up < 4; up++) {  // (the row's peer may sit on a parent)
+            el = muxm::VisualTreeHelper::GetParent(el).try_as<mux::UIElement>();
+            if (!el) break;
+            p = peers::FrameworkElementAutomationPeer::CreatePeerForElement(el);
+        }
+        if (!p) return "no peer\n";
+        if (auto inv = p.GetPattern(peers::PatternInterface::Invoke).try_as<winrt::Microsoft::UI::Xaml::Automation::Provider::IInvokeProvider>())
+            return inv.Invoke(), "invoked\n";
+        if (auto sel = p.GetPattern(peers::PatternInterface::SelectionItem).try_as<winrt::Microsoft::UI::Xaml::Automation::Provider::ISelectionItemProvider>())
+            return sel.Select(), "selected\n";
+    } catch (winrt::hresult_error const& e) {
+        char b[64];
+        sprintf_s(b, "failed 0x%08lx\n", (unsigned long)e.code());
+        return b;
+    }
+    return "no invoke/select pattern\n";
+}
+
 static bool IsCloseAllTabs(const winrt::hstring& text) {
     std::wstring t;
     for (wchar_t c : std::wstring_view(text))
@@ -5449,7 +5760,8 @@ static void ScheduleHoverCards() {
 struct PinnedRow {
     winrt::weak_ref<muxc::UserControl> row;
     winrt::weak_ref<muxc::Grid> grid;
-    winrt::event_token entered{}, exited{}, canceled{};
+    // Added with handledEventsToo: since Dia 1.7.3 the row's own parts mark the pointer events handled.
+    wf::IInspectable entered{nullptr}, exited{nullptr};  // (boxed PointerEventHandlers)
     bool pinned = false, inFolder = false;
 };
 static thread_local std::vector<PinnedRow> t_pinnedRows;
@@ -5515,16 +5827,133 @@ static void HidePinButton() {
     t_pin.overRow = t_pin.overButton = false;
 }
 
+static HWND TopWindowFor(const mux::XamlRoot& root);
+
+// ✕ closes a pinned tab the way Arc does: the tab closes and stays pinned. That is Dia's own Close in the
+// row's right-click menu (as is Ctrl+W); the row's "Close tab" button, which Dia shows on pinned tabs in
+// groups, removes the pinned tab instead, so it's never pressed. Dia builds that menu only on a real
+// right-click, so one is sent on the row's middle and the pointer goes straight back; the menu is hidden
+// the moment it's added (Ui_ElementAdded) and its Close pressed.
+static thread_local struct {
+    bool waiting = false, hiddenOnAdd = false;
+    ULONGLONG at = 0;
+    winrt::weak_ref<mux::FrameworkElement> row;
+    winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer timer{nullptr};
+} t_pinClose;
+
+static void EndPinnedClose(const char* why) {
+    if (!t_pinClose.waiting) return;
+    t_pinClose.waiting = false;
+    t_pinClose.row = nullptr;
+    if (t_pinClose.timer) t_pinClose.timer.Stop();
+    Log("pin: close %s", why);
+}
+
+// Dia's menu for the row, open now: hidden at once; with `run`, its Close pressed.
+static bool PinnedCloseMenu(bool run) {
+    auto row = t_pinClose.row.get();
+    if (!t_pinClose.waiting || !row || !row.XamlRoot()) return false;
+    for (auto const& pop : muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(row.XamlRoot())) {
+        auto presenter = pop.Child().try_as<muxc::MenuFlyoutPresenter>();
+        if (!presenter) continue;
+        if (presenter.Opacity() != 0) presenter.Opacity(0);
+        if (!run) return t_pinClose.hiddenOnAdd = true;
+        muxc::MenuFlyoutItem close{nullptr};
+        bool unpin = false;  // (a pinned tab's menu: Unpin, or in a group Edit pinned page)
+        FirstIn(presenter, [&](const mux::FrameworkElement& fe) {
+            if (auto mi = fe.try_as<muxc::MenuFlyoutItem>()) {
+                if (mi.Text() == L"Unpin") unpin = true;
+                if (mi.Text() == L"Close") close = mi;
+            } else if (auto sub = fe.try_as<muxc::MenuFlyoutSubItem>(); sub && sub.Text() == L"Edit pinned page") {
+                unpin = true;
+            }
+            return false;
+        });
+        if (!close || !unpin) {
+            if (presenter.Items().Size() == 0 && GetTickCount64() - t_pinClose.at < 1000) return true;  // (not filled in yet)
+            pop.IsOpen(false);
+            EndPinnedClose(!unpin ? "skipped: not a pinned tab's menu" : "skipped: no Close in the menu");
+            return true;
+        }
+        try {
+            winrt::Microsoft::UI::Xaml::Automation::Peers::MenuFlyoutItemAutomationPeer(close).Invoke();
+            EndPinnedClose(t_pinClose.hiddenOnAdd ? "done (Dia's Close; menu hidden as added)" : "done (Dia's Close)");
+        } catch (...) {
+            pop.IsOpen(false);
+            EndPinnedClose("failed: Close wouldn't run");
+        }
+        return true;
+    }
+    return false;
+}
+
+static void StartPinnedClose(const muxc::Grid& g) {
+    auto row = muxm::VisualTreeHelper::GetParent(g).try_as<mux::FrameworkElement>();
+    if (!row) row = g;
+    HWND top = row.XamlRoot() ? TopWindowFor(row.XamlRoot()) : nullptr;
+    if (!top || row.ActualWidth() <= 0) return Log("pin: close: row not on screen");
+    double scale = row.XamlRoot().RasterizationScale();
+    auto o = row.TransformToVisual(nullptr).TransformPoint({0, 0});
+    // Left of the middle, away from the ✕ and from the icon (which may be Dia's Back to Pinned URL).
+    POINT at{(LONG)std::lround((o.X + row.ActualWidth() * 0.45) * scale), (LONG)std::lround((o.Y + row.ActualHeight() / 2) * scale)};
+    ClientToScreen(top, &at);
+    POINT back;
+    GetCursorPos(&back);
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    auto abs = [&](INPUT& i, POINT p) {
+        i.mi.dx = (LONG)((p.x - vx) * 65535.0 / (vw - 1));
+        i.mi.dy = (LONG)((p.y - vy) * 65535.0 / (vh - 1));
+        i.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    };
+    INPUT in[4] = {};
+    for (auto& i : in) i.type = INPUT_MOUSE;
+    abs(in[0], at);
+    in[1].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+    in[2].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+    abs(in[3], back);
+    t_pinClose.waiting = true;
+    t_pinClose.hiddenOnAdd = false;
+    t_pinClose.at = GetTickCount64();
+    t_pinClose.row = winrt::make_weak(row);
+    if (!t_pinClose.timer) {
+        t_pinClose.timer = row.DispatcherQueue().CreateTimer();
+        t_pinClose.timer.Interval(std::chrono::milliseconds(15));
+        t_pinClose.timer.Tick([](auto&&, auto&&) {
+            try {
+                if (!t_pinClose.waiting) return t_pinClose.timer.Stop();
+                if (!PinnedCloseMenu(true) && GetTickCount64() - t_pinClose.at > 1000) EndPinnedClose("failed: Dia's menu didn't open");
+            } catch (...) {
+                EndPinnedClose("failed");
+            }
+        });
+    }
+    t_pinClose.timer.Start();
+    if (SendInput(4, in, sizeof(INPUT)) != 4) EndPinnedClose("failed: input refused");
+}
+
+// While a ✕'s close runs, and a moment after (the pointer's trip to the row and back), the ✕ stays hidden.
+static bool PinnedCloseBusy() { return t_pinClose.waiting || GetTickCount64() - t_pinClose.at < 400; }
+
+// (Ui_ElementAdded) a menu's parts are being added: if it's the one asked for, hide it before it shows.
+static void PinnedCloseMenuAdded() {
+    if (!t_pinClose.waiting) return;
+    try {
+        PinnedCloseMenu(false);
+    } catch (...) {
+    }
+}
+
 static void PressPinButton() {
     auto g = t_pin.grid.get();
     bool away = t_pin.away;
     HidePinButton();
     if (!g) return;
-    // What it showed when clicked: – only ever goes back (never closes, which removes a pinned tab).
+    // What it showed when clicked: – only ever goes back (never closes); ✕ closes and keeps it pinned.
     if (away) {
         if (auto back = RowButton(g, L"Back to Pinned URL", false)) PressButton(back, "back to pinned");
-    } else {
-        PressButton(RowButton(g, L"Close tab", false), "close pinned");
+    } else if (!t_pinClose.waiting) {
+        StartPinnedClose(g);
     }
 }
 
@@ -5600,7 +6029,7 @@ static bool PlacePinButton(const PinnedRow& r) {
     auto close = RowButton(g, L"Close tab", false);
     if (!close) return false;
     bool away = RowButton(g, L"Back to Pinned URL", true) != nullptr;
-    if (!away && r.inFolder) return false;  // (Dia shows its own ✕ there)
+    // (In groups Dia shows its own ✕ too, which removes the pinned tab: ours covers it there as well.)
     MakePinButton();
     t_pin.grid = winrt::make_weak(g);
     bool wasHeld = t_pin.held.get() == close;
@@ -5636,10 +6065,13 @@ static bool PlacePinButton(const PinnedRow& r) {
     return true;
 }
 
+static bool PinnedCloseBusy();
+
 static void PinnedRowHover(const winrt::weak_ref<muxc::Grid>& wg, bool on) {
     auto g = wg.get();
     auto r = PinnedRowFor(g);
     if (!r) return;
+    if (on && PinnedCloseBusy()) return;  // (the close's own right-click passing over the row: no ✕ flicker)
     if (on) {
         t_pin.overRow = PlacePinButton(*r);
         if (!t_pin.overRow && t_pin.grid.get() == g) HidePinButton();
@@ -5651,9 +6083,11 @@ static void PinnedRowHover(const winrt::weak_ref<muxc::Grid>& wg, bool on) {
 
 static void ForgetPinnedRow(PinnedRow& r) {
     if (auto row = r.row.get()) {
-        row.PointerEntered(r.entered);
-        row.PointerExited(r.exited);
-        row.PointerCanceled(r.canceled);
+        if (r.entered) row.RemoveHandler(mux::UIElement::PointerEnteredEvent(), r.entered);
+        if (r.exited) {
+            row.RemoveHandler(mux::UIElement::PointerExitedEvent(), r.exited);
+            row.RemoveHandler(mux::UIElement::PointerCanceledEvent(), r.exited);
+        }
     }
 }
 
@@ -5662,24 +6096,21 @@ static void AdoptPinnedRow(const muxc::UserControl& row, const muxc::Grid& g) {
     r.row = winrt::make_weak(row);
     r.grid = winrt::make_weak(g);
     auto wg = r.grid;
-    r.entered = row.PointerEntered([wg](auto&&, auto&&) {
+    r.entered = winrt::box_value(mux::Input::PointerEventHandler([wg](auto&&, auto&&) {
         try {
             PinnedRowHover(wg, true);
         } catch (...) {
         }
-    });
-    r.exited = row.PointerExited([wg](auto&&, auto&&) {
+    }));
+    r.exited = winrt::box_value(mux::Input::PointerEventHandler([wg](auto&&, auto&&) {
         try {
             PinnedRowHover(wg, false);
         } catch (...) {
         }
-    });
-    r.canceled = row.PointerCanceled([wg](auto&&, auto&&) {
-        try {
-            PinnedRowHover(wg, false);
-        } catch (...) {
-        }
-    });
+    }));
+    row.AddHandler(mux::UIElement::PointerEnteredEvent(), r.entered, true);
+    row.AddHandler(mux::UIElement::PointerExitedEvent(), r.exited, true);
+    row.AddHandler(mux::UIElement::PointerCanceledEvent(), r.exited, true);
     t_pinnedRows.push_back(std::move(r));
 }
 
@@ -5752,6 +6183,29 @@ static void UpdatePinnedMarks() {
         }
         t_pinnedMarks.push_back(std::move(m));
     }
+}
+
+std::string Pin_DebugState() {  // (`diatweaks probe PINSTATE`)
+    std::ostringstream o;
+    o << "tweak=" << Engine_TweakOn(L"arcPinnedTabs") << " rows=" << t_pinnedRows.size();
+    int pinned = 0;
+    for (auto& r : t_pinnedRows) pinned += r.pinned;
+    o << " pinned=" << pinned << " popup=" << (t_pin.popup ? (t_pin.popup.IsOpen() ? "open" : "closed") : "none")
+      << " overRow=" << t_pin.overRow << " overButton=" << t_pin.overButton << " away=" << t_pin.away;
+    if (t_pin.popup) o << " at=" << t_pin.popup.HorizontalOffset() << "," << t_pin.popup.VerticalOffset();
+    if (t_pin.button) o << " size=" << t_pin.button.ActualWidth() << "x" << t_pin.button.ActualHeight();
+    return o.str() + "\n";
+}
+
+// ROWBTN:i:Name presses the row's own button of that accessible name (e.g. Close_tab), as the ✕ does.
+std::string Pin_DebugPressRowButton(int index, const std::wstring& name) {
+    extern std::vector<mux::FrameworkElement> Tabs_DebugTargets();
+    auto rows = Tabs_DebugTargets();
+    if (index < 0 || index >= (int)rows.size()) return "no row\n";
+    auto g = rows[index].as<muxc::UserControl>().Content().try_as<muxc::Grid>();
+    auto b = g ? RowButton(g, name.c_str(), false) : nullptr;
+    if (!b) return "no button\n";
+    return PressButton(b, "row button") ? "pressed\n" : "press failed\n";
 }
 
 static void UpdatePinnedTabs() {
@@ -7560,6 +8014,7 @@ void Ui_ElementAdded(const std::wstring& name) {
         ScheduleArcAdopt();
     }
     if (name == L"ActionsRow") ScheduleHoverCards();
+    if (name == L"MenuFlyoutPresenterScrollViewer" || name == L"ScrollContentPresenter") PinnedCloseMenuAdded();
     if (name == L"DialogOTPCountdownRoot") ScheduleCreateProfileEmoji();  // (a dialog: maybe Create Profile)
     if (name == L"ColorSwatchStack" && Engine_TweakOn(L"profileEmoji"))  // Settings > Profiles: the Emoji row with the rest
         if (auto q = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread())
