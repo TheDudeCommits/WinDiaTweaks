@@ -365,6 +365,11 @@ static void RunProbe() {
             Tabs_DebugOpenMenus(o, press);
             continue;
         }
+        if (nm == L"TABLIST") {
+            extern std::string Tabs_DebugList();
+            o << Tabs_DebugList();
+            continue;
+        }
         if (nm == L"PINSTATE") {
             extern std::string Pin_DebugState();
             o << Pin_DebugState();
@@ -777,13 +782,13 @@ static void ApplyPreset(const std::wstring& preset) {
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
                                                L"peek",           L"tidyTabs",            L"mediaControls",
-                                               L"arcPinnedTabs"};
+                                               L"arcPinnedTabs", L"collapsePinned"};
     // Arc (Windows): the same, but like Arc for Windows the toolbar stays, in the sidebar's color, with
     // the site centered in it (the Centered address bar).
     static const std::set<std::wstring> arcWindows = {L"edgeToEdge",       L"squareCorners",    L"arcUrlBar",
                                                       L"floatingNewTab",   L"hideTabSearchButton", L"hideChatButton",
                                                       L"hideTabHoverCard", L"windowMaterial",   L"peek",
-                                                      L"tidyTabs",         L"mediaControls",    L"arcPinnedTabs"};
+                                                      L"tidyTabs",         L"mediaControls",    L"arcPinnedTabs", L"collapsePinned"};
     bool isArc = preset == L"arc", isArcWindows = preset == L"arcWindows";
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
@@ -4355,6 +4360,37 @@ static std::vector<mux::FrameworkElement> DebugTargets() { return t_debugTiles ?
 void Tabs_DebugUseTiles(bool on) { t_debugTiles = on; }
 std::vector<mux::FrameworkElement> Tabs_DebugTargets() { return DebugTargets(); }
 
+std::string Tabs_DebugList() {  // (`diatweaks probe TABLIST`: the list the pinned rows live in)
+    std::ostringstream o;
+    for (auto h : FindNodes(L"TabSeparatorRow")) {
+        auto sep = Obj<mux::FrameworkElement>(h);
+        auto list = sep ? muxm::VisualTreeHelper::GetParent(sep).try_as<muxc::Panel>() : nullptr;
+        if (!list || list.ActualHeight() <= 0) continue;
+        o << "list " << N(std::wstring(winrt::get_class_name(list))) << " \"" << N(std::wstring(list.Name())) << "\" h=" << list.ActualHeight();
+        if (auto sp = list.try_as<muxc::StackPanel>()) o << " spacing=" << sp.Spacing() << " pad=" << sp.Padding().Top;
+        o << "\n";
+        int up = 0;
+        for (auto a = muxm::VisualTreeHelper::GetParent(list); a && up < 6; a = muxm::VisualTreeHelper::GetParent(a), up++) {
+            auto fe = a.try_as<mux::FrameworkElement>();
+            o << "  ^" << N(std::wstring(winrt::get_class_name(a))) << " \"" << (fe ? N(std::wstring(fe.Name())) : "") << "\"";
+            if (auto p = a.try_as<muxc::Panel>()) o << " children=" << p.Children().Size();
+            if (fe) o << " h=" << fe.ActualHeight();
+            o << "\n";
+        }
+        int i = 0;
+        for (auto const& c : list.Children()) {
+            auto fe = c.try_as<mux::FrameworkElement>();
+            o << "  [" << i++ << "] " << N(std::wstring(winrt::get_class_name(c))) << " \"" << (fe ? N(std::wstring(fe.Name())) : "") << "\"";
+            if (fe) {
+                o << " h=" << fe.ActualHeight() << " vis=" << (fe.Visibility() == mux::Visibility::Visible ? "V" : "C") << " margin=" << fe.Margin().Top << "," << fe.Margin().Bottom;
+                o << " \"" << RowTitle(fe).substr(0, 40) << "\"";
+            }
+            o << "\n";
+        }
+    }
+    return o.str();
+}
+
 void Tabs_DebugOpenMenus(std::ostringstream& o, const std::wstring& press) {
     for (auto h : FindNodes(L"SidebarBorder"))
         if (auto any = Obj<mux::FrameworkElement>(h); any && any.XamlRoot()) {
@@ -6248,6 +6284,284 @@ static void UpdatePinnedTabs() {
     if (t_pin.popup && t_pin.popup.IsOpen()) {
         auto r = PinnedRowFor(t_pin.grid.get());
         if (!r || !PlacePinButton(*r)) HidePinButton();
+    }
+}
+
+// ---------------------------------------------------------------- Collapse pinned tabs
+// As in DiaTweaks on the Mac (after Arc): a "Pinned" line above the pinned tabs and folders, with a pin,
+// the word, a hairline and a chevron. Clicking it folds them away, and again brings them back; each
+// profile remembers which way it was left (the tweak's value lists the folded ones by their page in the
+// sidebar, "p0 p3"). The line is ours, laid over the top of Dia's list (RowsPanel, whose top padding we
+// raise to make room) in the grid that holds the list; folding collapses Dia's pinned rows (the list's
+// children above TabSeparatorRow), and the rows below slide up into their place.
+
+static const double kPinnedHeaderH = 28;
+
+struct PinnedFold {
+    winrt::weak_ref<muxc::StackPanel> list;  // Dia's RowsPanel
+    winrt::weak_ref<muxc::Grid> host;        // the grid holding it (and our line)
+    muxc::Grid header{nullptr};
+    muxc::FontIcon pin{nullptr}, chevron{nullptr};
+    muxc::TextBlock title{nullptr};
+    muxc::Border line{nullptr};
+    mux::Thickness diaPadding{};
+    std::wstring key;  // the profile's page: "p3"
+    bool collapsed = false, hovered = false;
+    std::vector<winrt::weak_ref<mux::UIElement>> folded;  // Dia's rows we collapsed
+};
+static thread_local std::vector<std::shared_ptr<PinnedFold>> t_folds;
+
+static std::set<std::wstring> FoldedPages() {
+    std::set<std::wstring> out;
+    std::wstringstream ss(Engine_TweakValue(L"collapsePinned"));
+    std::wstring w;
+    while (ss >> w)
+        if (w.size() > 1 && w[0] == L'p') out.insert(w);
+    return out;
+}
+
+static void StylePinnedHeader(PinnedFold& f) {
+    if (!f.header) return;
+    auto ink = BrushRes(f.hovered ? L"TextFillColorSecondaryBrush" : L"TextFillColorTertiaryBrush",
+                        Rgba(255, 255, 255, f.hovered ? 0xc5 : 0x87));
+    f.pin.Foreground(ink), f.title.Foreground(ink), f.chevron.Foreground(ink);
+    winrt::hstring glyph = f.collapsed ? L"\xE970" : L"\xE96E";  // chevron right / down
+    if (f.chevron.Glyph() != glyph) f.chevron.Glyph(glyph);
+    f.line.Opacity(f.collapsed ? 0 : 1);
+    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(f.header, f.collapsed ? L"Pinned, folded" : L"Pinned");
+}
+
+// Folding: `change` shows or hides rows, and the rows that stay slide from where they were to their new
+// place (each row's move measured, then played back on the compositor) while rows that appear fade in.
+static void SlideListRows(const muxc::StackPanel& list, const std::function<void()>& change) {
+    namespace comp = winrt::Microsoft::UI::Composition;
+    using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
+    std::vector<std::pair<mux::UIElement, double>> before;
+    try {
+        for (auto const& ch : list.Children())
+            if (ch.Visibility() == mux::Visibility::Visible) before.push_back({ch, ch.TransformToVisual(list).TransformPoint({0, 0}).Y});
+    } catch (...) {
+    }
+    change();
+    try {
+        list.UpdateLayout();
+        auto c = ElementCompositionPreview::GetElementVisual(list).Compositor();
+        auto ease = c.CreateCubicBezierEasingFunction({0.2f, 0.0f}, {0.0f, 1.0f});
+        for (auto const& ch : list.Children()) {
+            if (ch.Visibility() != mux::Visibility::Visible) continue;
+            auto was = std::find_if(before.begin(), before.end(), [&](auto& b) { return b.first == ch; });
+            auto v = ElementCompositionPreview::GetElementVisual(ch);
+            if (was == before.end()) {  // just shown: fades in
+                auto fade = c.CreateScalarKeyFrameAnimation();
+                fade.InsertKeyFrame(0.0f, 0.0f);
+                fade.InsertKeyFrame(1.0f, 1.0f, ease);
+                fade.Duration(std::chrono::milliseconds(220));
+                v.StartAnimation(L"Opacity", fade);
+                continue;
+            }
+            double d = was->second - ch.TransformToVisual(list).TransformPoint({0, 0}).Y;
+            if (std::abs(d) < 0.5) continue;
+            ElementCompositionPreview::SetIsTranslationEnabled(ch, true);
+            v.Properties().InsertVector3(L"Translation", {0.0f, (float)d, 0.0f});
+            auto slide = c.CreateVector3KeyFrameAnimation();
+            slide.InsertKeyFrame(0.0f, {0.0f, (float)d, 0.0f});
+            slide.InsertKeyFrame(1.0f, {0.0f, 0.0f, 0.0f}, ease);
+            slide.Duration(std::chrono::milliseconds(250));
+            v.StartAnimation(L"Translation", slide);
+        }
+    } catch (...) {
+    }
+}
+
+static void ApplyPinnedFold(PinnedFold& f, bool animate);
+
+static void ToggleFold(const std::shared_ptr<PinnedFold>& fp) {
+    auto pages = FoldedPages();
+    bool fold = !pages.count(fp->key);
+    if (fold) pages.insert(fp->key);
+    else pages.erase(fp->key);
+    std::wstring v;
+    for (auto& p : pages) v += (v.empty() ? L"" : L" ") + p;
+    if (v.empty()) v = L"-";
+    for (auto& f : t_folds)  // (every window's list of that profile)
+        if (f->key == fp->key) f->collapsed = fold, ApplyPinnedFold(*f, true);
+    Engine_SetMany({}, {{L"collapsePinned", v}});  // (not a hand change of a patch: the preset stays)
+}
+
+static void MakePinnedHeader(const std::shared_ptr<PinnedFold>& fp) {
+    auto& f = *fp;
+    std::weak_ptr<PinnedFold> weak = fp;
+    f.header = muxc::Grid();
+    f.header.Name(L"diatweaksPinnedHeader");
+    f.header.Height(kPinnedHeaderH);
+    f.header.VerticalAlignment(mux::VerticalAlignment::Top);
+    f.header.Background(muxm::SolidColorBrush(Rgba(0, 0, 0, 0)));  // (the whole line takes the click)
+    for (auto w : {mux::GridLength{0, mux::GridUnitType::Auto}, mux::GridLength{0, mux::GridUnitType::Auto},
+                   mux::GridLength{1, mux::GridUnitType::Star}, mux::GridLength{0, mux::GridUnitType::Auto}}) {
+        muxc::ColumnDefinition cd;
+        cd.Width(w);
+        f.header.ColumnDefinitions().Append(cd);
+    }
+    auto icons = muxm::FontFamily(L"Segoe Fluent Icons, Segoe MDL2 Assets");
+    f.pin = muxc::FontIcon();
+    f.pin.FontFamily(icons);
+    f.pin.Glyph(L"\xE841");  // pinned, filled
+    f.pin.FontSize(11);
+    f.pin.Width(16);
+    f.pin.Margin({17, 0, 0, 0});  // (under the rows' icons)
+    f.pin.VerticalAlignment(mux::VerticalAlignment::Center);
+    f.title = muxc::TextBlock();
+    f.title.Text(L"Pinned");
+    f.title.FontSize(11);
+    f.title.FontWeight(winrt::Windows::UI::Text::FontWeight{500});
+    f.title.Margin({8, 0, 8, 1});  // (starts where the rows' titles do)
+    f.title.VerticalAlignment(mux::VerticalAlignment::Center);
+    muxc::Grid::SetColumn(f.title, 1);
+    f.line = muxc::Border();
+    f.line.Height(1);
+    f.line.VerticalAlignment(mux::VerticalAlignment::Center);
+    f.line.Background(muxm::SolidColorBrush(Rgba(255, 255, 255, 0x15)));
+    f.line.IsHitTestVisible(false);
+    muxc::Grid::SetColumn(f.line, 2);
+    f.chevron = muxc::FontIcon();
+    f.chevron.FontFamily(icons);
+    f.chevron.FontSize(8);
+    f.chevron.Width(12);
+    f.chevron.Margin({8, 0, 20, 0});  // (under the ✕ of the rows)
+    f.chevron.VerticalAlignment(mux::VerticalAlignment::Center);
+    muxc::Grid::SetColumn(f.chevron, 3);
+    for (mux::UIElement e : {mux::UIElement(f.pin), mux::UIElement(f.title), mux::UIElement(f.line), mux::UIElement(f.chevron)})
+        f.header.Children().Append(e);
+    f.header.PointerEntered([weak](auto&&, auto&&) {
+        if (auto p = weak.lock()) p->hovered = true, StylePinnedHeader(*p);
+    });
+    f.header.PointerExited([weak](auto&&, auto&&) {
+        if (auto p = weak.lock()) p->hovered = false, StylePinnedHeader(*p);
+    });
+    f.header.Tapped([weak](auto&&, mux::Input::TappedRoutedEventArgs const& e) {
+        e.Handled(true);
+        try {
+            if (auto p = weak.lock()) ToggleFold(p);
+        } catch (...) {
+        }
+    });
+    f.header.DoubleTapped([](auto&&, mux::Input::DoubleTappedRoutedEventArgs const& e) { e.Handled(true); });
+    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(f.header, L"Pinned");
+}
+
+// Folds or unfolds this list's pinned rows (and keeps new ones folded).
+static void ApplyPinnedFold(PinnedFold& f, bool animate) {
+    auto list = f.list.get();
+    if (!list) return;
+    int sep = -1, i = 0;
+    for (auto const& c : list.Children()) {
+        if (auto fe = c.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"TabSeparatorRow") {
+            sep = i;
+            break;
+        }
+        i++;
+    }
+    auto fold = [&] {
+        for (int k = 0; k < sep; k++) {
+            auto el = list.Children().GetAt(k);
+            if (el.Visibility() != mux::Visibility::Visible) continue;
+            el.Visibility(mux::Visibility::Collapsed);
+            if (std::none_of(f.folded.begin(), f.folded.end(), [&](auto& w) { return w.get() == el; })) f.folded.push_back(winrt::make_weak(el));
+        }
+    };
+    auto unfold = [&] {
+        for (auto& w : f.folded)
+            if (auto el = w.get()) el.Visibility(mux::Visibility::Visible);
+        f.folded.clear();
+    };
+    if (f.collapsed && sep > 0) {
+        bool any = false;  // (rows to fold: the fold itself, or new pinned rows while folded)
+        for (int k = 0; k < sep && !any; k++) any = list.Children().GetAt(k).Visibility() == mux::Visibility::Visible;
+        if (any) animate ? SlideListRows(list, fold) : fold();
+    } else if (!f.collapsed && !f.folded.empty()) {
+        animate ? SlideListRows(list, unfold) : unfold();
+    }
+    StylePinnedHeader(f);
+}
+
+static void RemovePinnedFold(PinnedFold& f) {
+    for (auto& w : f.folded)
+        if (auto el = w.get()) el.Visibility(mux::Visibility::Visible);
+    f.folded.clear();
+    if (auto list = f.list.get()) list.Padding(f.diaPadding);
+    if (auto host = f.host.get(); host && f.header) {
+        uint32_t i;
+        if (host.Children().IndexOf(f.header, i)) host.Children().RemoveAt(i);
+    }
+    f.header = nullptr;
+}
+
+// The page (profile) a list belongs to: its place among the sidebar's pages, one sidebar wide each.
+static std::wstring PinnedPageKey(const mux::FrameworkElement& list) {
+    for (mux::DependencyObject d = list; d; d = muxm::VisualTreeHelper::GetParent(d)) {
+        auto parent = muxm::VisualTreeHelper::GetParent(d);
+        auto pages = parent.try_as<muxc::StackPanel>();
+        if (pages && pages.Name() == L"SpacePagesPanel") {
+            uint32_t i;
+            if (auto el = d.try_as<mux::UIElement>(); el && pages.Children().IndexOf(el, i)) return L"p" + std::to_wstring(i);
+            return L"";
+        }
+    }
+    return L"";
+}
+
+static void UpdateCollapsePinned() {
+    if (!Engine_TweakOn(L"collapsePinned")) {
+        for (auto& f : t_folds) RemovePinnedFold(*f);
+        t_folds.clear();
+        return;
+    }
+    std::erase_if(t_folds, [](const std::shared_ptr<PinnedFold>& f) {
+        auto list = f->list.get();
+        if (list && list.IsLoaded()) return false;
+        RemovePinnedFold(*f);
+        return true;
+    });
+    auto pages = FoldedPages();
+    for (auto h : FindNodes(L"TabSeparatorRow")) {
+        auto sep = Obj<mux::FrameworkElement>(h);
+        auto list = sep ? muxm::VisualTreeHelper::GetParent(sep).try_as<muxc::StackPanel>() : nullptr;
+        auto host = list ? muxm::VisualTreeHelper::GetParent(list).try_as<muxc::Grid>() : nullptr;
+        if (!list || !host || !list.IsLoaded()) continue;
+        uint32_t sepAt = 0;
+        list.Children().IndexOf(sep, sepAt);
+        std::shared_ptr<PinnedFold> f;
+        for (auto& x : t_folds)
+            if (x->list.get() == list) f = x;
+        if (!f) {
+            if (sepAt == 0) continue;  // no pinned tabs: no line
+            f = std::make_shared<PinnedFold>();
+            f->list = winrt::make_weak(list);
+            f->host = winrt::make_weak(host);
+            f->diaPadding = list.Padding();
+            f->key = PinnedPageKey(list);
+            MakePinnedHeader(f);
+            muxc::Grid::SetRow(f->header, muxc::Grid::GetRow(list));
+            muxc::Grid::SetColumn(f->header, muxc::Grid::GetColumn(list));
+            host.Children().Append(f->header);
+            t_folds.push_back(f);
+        }
+        // Nothing pinned (all unpinned since): no line, and the list as Dia has it.
+        if (sepAt == 0 && f->folded.empty()) {
+            if (f->header.Visibility() != mux::Visibility::Collapsed) f->header.Visibility(mux::Visibility::Collapsed);
+            if (list.Padding() != f->diaPadding) list.Padding(f->diaPadding);
+            continue;
+        }
+        if (f->header.Visibility() != mux::Visibility::Visible) f->header.Visibility(mux::Visibility::Visible);
+        auto m = list.Margin();
+        if (f->header.Margin() != mux::Thickness{m.Left, m.Top, m.Right, 0}) f->header.Margin({m.Left, m.Top, m.Right, 0});
+        mux::Thickness pad = f->diaPadding;
+        pad.Top += kPinnedHeaderH;
+        if (list.Padding() != pad) list.Padding(pad);
+        bool want = !f->key.empty() && pages.count(f->key);
+        bool animate = want != f->collapsed;
+        f->collapsed = want;
+        ApplyPinnedFold(*f, animate);
     }
 }
 
@@ -10284,7 +10598,7 @@ bool Ui_Tick() {
         Peek_Tick();
         stage = "hoverCards";
         UpdateHoverCards();
-        if (tick % 3 == 1) stage = "pinnedTabs", UpdatePinnedTabs(), UpdatePinnedMarks();
+        if (tick % 3 == 1) stage = "pinnedTabs", UpdatePinnedTabs(), UpdatePinnedMarks(), UpdateCollapsePinned();
         UpdateCleanSearchBox();
         History_Tick();
         UpdateTidyTabs();
