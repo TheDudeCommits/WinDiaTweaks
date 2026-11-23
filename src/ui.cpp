@@ -448,6 +448,18 @@ static void RunProbe() {
             }
             continue;
         }
+        if (nm.rfind(L"NAMES:", 0) == 0) {  // NAMES:text: every live element whose name holds that text
+            std::wstring want = nm.substr(6);
+            std::transform(want.begin(), want.end(), want.begin(), ::towlower);
+            std::set<std::wstring> seen;
+            Engine_ForEachNode([&](const NodeRef& r) {
+                std::wstring n = r.name;
+                std::transform(n.begin(), n.end(), n.begin(), ::towlower);
+                if (!n.empty() && n.find(want) != std::wstring::npos && seen.insert(r.type + L" " + r.name).second)
+                    o << N(r.type) << " \"" << N(r.name) << "\"\n";
+            });
+            continue;
+        }
         if (nm.rfind(L"UP:", 0) == 0) {  // UP:Name: that element and every ancestor, up to the root
             for (auto h : FindNodes(nm.substr(3))) {
                 int depth = 0;
