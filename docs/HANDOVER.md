@@ -1,7 +1,7 @@
 # Handover: Windows Dia to match the Mac (Arc look)
 
-Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. Last release **`v1.3.2-mac.8`** (everything under "Done"),
-which the PC (`dude-pc`) runs. Dia on the PC is now **1.7.3.2**.
+Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. Last release **`v1.3.2-mac.8`** (everything under "Done");
+the PC (`dude-pc`) runs a local build with the − change on top of it. Dia on the PC is now **1.7.3.2**.
 
 The reference is the MacBook Air's Dia with DiaTweaks (`~/DiaTweaks`, its settings in
 `~/Library/Preferences/com.diapatches.plist`), which is styled after Arc. Screen capture over ssh is blocked by
@@ -31,6 +31,16 @@ macOS privacy settings on both Macs, so the Mac source and settings were the ref
   copy of it (the Mac's Show Loading Progress).
 - `cleanSearchBox` turned on (the Mac's Compact Command Bar).
 
+## Done after v1.3.2-mac.8 (tested on a throwaway pin, committed, not released)
+
+- **− on open pinned tabs, as on the Mac** (the user's choice): the pinned tab's button is now the Mac's −
+  ("Minus Button on Open Pinned Tabs"), and it closes the page and keeps the pin, also on a tab that has moved
+  to another page. Going back to the pinned page is Dia's own, as on the Mac: the "/" after the icon, and
+  pointing at the icon shows "Back to Pinned URL"; a click goes back. The tweak used to hide Dia's "/" and
+  used – for going back; that hiding is gone.
+- On a closed pinned tab the − still shows and does nothing (Dia's Close on a closed tab). The Mac shows
+  Dia's ✕ there; Windows has no signal yet for "this pinned tab has no page open".
+
 ## Not done
 
 - **Open new tabs next to current**: Dia appends new tabs at the end; moving one needs a synthetic drag.
@@ -39,9 +49,6 @@ macOS privacy settings on both Macs, so the Mac source and settings were the ref
 - **Close tabs from the Ctrl+Tab switcher**: the switcher isn't a reachable XAML element or popup.
 - **Little Dia**: Edge is the default browser on the PC, so links from other apps don't reach Dia.
 - Drag window from page, Open sidebar instantly, Keep folders open: not looked at.
-- **Open question for the user**: the Mac shows **−** (not ✕) on pinned tabs with a page open, and that −
-  closes the page and keeps the pin. Windows shows ✕ there (as this handover asked) and − only for "back to
-  pinned page".
 
 ## Working on the PC
 
