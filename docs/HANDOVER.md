@@ -1,14 +1,13 @@
 # Handover: Windows Dia to match the Mac (Arc look)
 
-Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. Last release `v1.3.2-mac.7`. The PC (`dude-pc`) runs a local
-build of this branch (`v1.3.2-mac.7-8-g…`), not a release: nothing below is pushed or released yet.
-Dia on the PC is now **1.7.3.2**.
+Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. Last release **`v1.3.2-mac.8`** (everything under "Done"),
+which the PC (`dude-pc`) runs. Dia on the PC is now **1.7.3.2**.
 
 The reference is the MacBook Air's Dia with DiaTweaks (`~/DiaTweaks`, its settings in
 `~/Library/Preferences/com.diapatches.plist`), which is styled after Arc. Screen capture over ssh is blocked by
 macOS privacy settings on both Macs, so the Mac source and settings were the reference, not screenshots.
 
-## Done (built, tested on the PC with throwaway tabs, committed)
+## Done (tested on the PC with throwaway tabs, released in v1.3.2-mac.8)
 
 - **Pinned ✕ keeps the pin.** Found by testing on throwaway pins: Dia's row button "Close tab" removes a pinned
   tab (in the list, and in groups where Dia shows it itself), but Dia's right-click **Close** (and Ctrl+W)
@@ -73,5 +72,6 @@ clicks and screenshots in one run: `~/wdt-seq.ps1 -Steps "focus;keys:^t;sleep:80
 - Never test by closing a real pinned tab.
 - On the Mac, don't restart Dia or switch tabs without asking.
 - Don't copy the user's account email from the logs anywhere.
-- Push and release only when asked. Release: push a tag `v1.3.2-mac.N` (CI builds `WinDiaTweaks.zip`), then
-  `wdt-update.ps1 -Tag … -Sha256 …`.
+- Push and release only when asked. Release: push a lightweight tag `v1.3.2-mac.N` (CI builds `WinDiaTweaks.zip`
+  and writes the notes from the commit subjects), then `~/wdt-update.ps1 -Tag … -Sha256 …` through `wdt-task.ps1`
+  (it closes and reopens Dia, so check idle time first).
