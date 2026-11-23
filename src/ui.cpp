@@ -6847,6 +6847,9 @@ struct ArcState {
     winrt::weak_ref<muxc::Canvas> mirrorBox;
     std::vector<std::pair<winrt::weak_ref<muxc::Button>, muxc::Button>> mirrors;  // (Dia's, ours)
     bool mirrorsShown = false;
+    winrt::weak_ref<muxc::Border> loadingBox;  // (UpdateArcLoading) where Dia's loading indicator shows in the pill
+    winrt::Microsoft::UI::Composition::CompositionVisualSurface loadingSurface{nullptr};
+    winrt::Microsoft::UI::Composition::SpriteVisual loadingSprite{nullptr};
     winrt::weak_ref<mux::UIElement> site;
     // Dia's ☆ button, out of the pill (it's in the panel, as on the Mac): Dia's own visibility, and our watch.
     winrt::weak_ref<mux::FrameworkElement> bookmark;
@@ -7194,6 +7197,8 @@ static void RestoreArcPanel(ArcState& st) {
     if (auto p = st.panelButton.get()) p.Visibility(mux::Visibility::Collapsed), p.Content(nullptr);
     if (auto box = st.mirrorBox.get()) box.Visibility(mux::Visibility::Collapsed);
     st.mirrors.clear();
+    if (auto lb = st.loadingBox.get()) lb.Visibility(mux::Visibility::Collapsed);
+    if (st.loadingSurface) st.loadingSurface.SourceVisual(nullptr);
 }
 
 // Presses one of Dia's buttons once our panel has closed, so whatever it opens isn't closed with it.
@@ -7663,6 +7668,67 @@ static void UpdateArcMirrors(ArcState& st) {
             v.StartAnimation(L"Opacity", fade);
         } catch (...) {
         }
+    }
+}
+
+// ---- Loading. Dia's loading indicator (the line and glow that run along the address field while a page
+// loads, as in Arc) is in the same clipped field as the capsule's buttons, so it never showed in the pill.
+// The pill shows a live copy of it: a visual surface of Dia's own indicator, so it looks and moves exactly
+// as Dia draws it, and goes when Dia's does.
+static void UpdateArcLoading(ArcState& st) {
+    namespace comp = winrt::Microsoft::UI::Composition;
+    using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
+    auto url = st.url.get().try_as<muxc::Grid>();
+    auto host = url ? ArcHost(st) : nullptr;
+    if (!url || !host || host != st.address.get() || url.ActualWidth() <= 0) return;
+    auto layer = FindByName(host, L"LoadingIndicatorLayer");
+    if (!layer) return;
+    auto box = st.loadingBox.get();
+    if (!box) {
+        box = muxc::Border{};
+        box.Name(L"diatweaksArcLoading");
+        box.IsHitTestVisible(false);
+        box.HorizontalAlignment(mux::HorizontalAlignment::Left);
+        box.VerticalAlignment(mux::VerticalAlignment::Top);
+        muxc::Grid::SetColumnSpan(box, (std::max)(1, (int)url.ColumnDefinitions().Size()));
+        url.Children().InsertAt(0, box);  // (under the site text and the buttons)
+        st.loadingBox = winrt::make_weak(box);
+    }
+    if (box.Visibility() != mux::Visibility::Visible) box.Visibility(mux::Visibility::Visible);
+    try {
+        auto source = ElementCompositionPreview::GetElementVisual(layer);
+        auto c = source.Compositor();
+        if (!st.loadingSprite) {
+            st.loadingSurface = c.CreateVisualSurface();
+            st.loadingSprite = c.CreateSpriteVisual();
+            auto brush = c.CreateSurfaceBrush(st.loadingSurface);
+            brush.Stretch(comp::CompositionStretch::None);
+            brush.HorizontalAlignmentRatio(0), brush.VerticalAlignmentRatio(0);
+            st.loadingSprite.Brush(brush);
+        }
+        if (ElementCompositionPreview::GetElementChildVisual(box) != st.loadingSprite) ElementCompositionPreview::SetElementChildVisual(box, st.loadingSprite);
+        if (st.loadingSurface.SourceVisual() != source) st.loadingSurface.SourceVisual(source);
+        // Where Dia's field sits over the pill (FlushArcTrailing laid it there), at its size.
+        auto r = layer.TransformToVisual(url).TransformBounds({0, 0, (float)layer.ActualWidth(), (float)layer.ActualHeight()});
+        mux::Thickness m{r.X, r.Y, 0, 0};
+        if (std::abs(box.Margin().Left - m.Left) > 0.25 || std::abs(box.Margin().Top - m.Top) > 0.25) box.Margin(m);
+        if (std::abs(box.Width() - r.Width) > 0.25 || std::isnan(box.Width())) box.Width(r.Width), box.Height(r.Height);
+        winrt::Windows::Foundation::Numerics::float2 size{(float)layer.ActualWidth(), (float)layer.ActualHeight()};
+        if (st.loadingSurface.SourceSize() != size) st.loadingSurface.SourceSize(size);
+        if (st.loadingSprite.Size() != size) st.loadingSprite.Size(size);
+        // Inside the pill's rounded corners, as Dia's field clips it.
+        double radius = url.CornerRadius().TopLeft;
+        auto clip = st.loadingSprite.Clip().try_as<comp::CompositionGeometricClip>();
+        auto geo = clip ? clip.Geometry().try_as<comp::CompositionRoundedRectangleGeometry>() : nullptr;
+        if (!geo) {
+            geo = c.CreateRoundedRectangleGeometry();
+            st.loadingSprite.Clip(c.CreateGeometricClip(geo));
+        }
+        winrt::Windows::Foundation::Numerics::float2 off{(float)-r.X, (float)-r.Y}, pill{(float)url.ActualWidth(), (float)url.ActualHeight()};
+        if (geo.Offset() != off) geo.Offset(off);
+        if (geo.Size() != pill) geo.Size(pill);
+        if (geo.CornerRadius().x != (float)radius) geo.CornerRadius({(float)radius, (float)radius});
+    } catch (...) {
     }
 }
 
@@ -8571,6 +8637,7 @@ static void UpdateArcBar() {
         FlushArcTrailing(st);
         UpdateArcPanel(st);
         UpdateArcMirrors(st);
+        UpdateArcLoading(st);
         UpdateArcLabel(st);
         ArcStyleHeader(st);
         if (st.swapped) st.swapped = false, UpdateAddressField();
