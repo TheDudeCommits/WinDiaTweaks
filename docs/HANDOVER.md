@@ -1,91 +1,77 @@
-# Handover: closing a pinned tab must not delete it (Windows)
+# Handover: Windows Dia to match the Mac (Arc look)
 
-Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. The last release is `v1.3.2-mac.7`, and it's installed on the PC (`dude-pc`).
+Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. Last release `v1.3.2-mac.7`. The PC (`dude-pc`) runs a local
+build of this branch (`v1.3.2-mac.7-8-g…`), not a release: nothing below is pushed or released yet.
+Dia on the PC is now **1.7.3.2**.
 
-## The bug
+The reference is the MacBook Air's Dia with DiaTweaks (`~/DiaTweaks`, its settings in
+`~/Library/Preferences/com.diapatches.plist`), which is styled after Arc. Screen capture over ssh is blocked by
+macOS privacy settings on both Macs, so the Mac source and settings were the reference, not screenshots.
 
-On Windows, closing a pinned (bookmarked) tab in Dia's sidebar also deletes it from the pinned list. It should act like Arc on the Mac:
+## Done (built, tested on the PC with throwaway tabs, committed)
 
-- **✕ on a pinned tab** closes or unloads the tab, but it **stays pinned** in the sidebar. Clicking it again loads its pinned page.
-- **– on a pinned tab that has moved to another page** goes back to its pinned page. This part already works.
-- **Ctrl+W on a pinned tab** should also keep it pinned. Check what Dia does today first, but be careful: the test can delete a pinned tab.
+- **Pinned ✕ keeps the pin.** Found by testing on throwaway pins: Dia's row button "Close tab" removes a pinned
+  tab (in the list, and in groups where Dia shows it itself), but Dia's right-click **Close** (and Ctrl+W)
+  closes the tab and keeps it pinned, as Arc does. There is no Unload item. The ✕ now right-clicks the row
+  (pointer goes straight back), hides the menu as it's added, and presses its Close. Our ✕ also covers Dia's
+  own ✕ on pinned tabs in groups. Grouped pinned tabs have no "Unpin" in their menu; "Edit pinned page" marks
+  them as pinned. Pinned tiles (the dock) keep their pin on Close too.
+- **The ✕ never showed on Dia 1.7.3**: the row now marks pointer events handled; hover handlers take handled
+  events.
+- **Collapse pinned tabs** (`collapsePinned`): the Mac's "Pinned" line above the pinned tabs and folders; click
+  folds them (rows below slide), remembered per profile page.
+- **Keyboard** (Mac's DiaTweaks shortcuts, Ctrl for ⌘): Ctrl+D pin/unpin (Dia's Ctrl+Shift+D; Dia's Ctrl+D
+  bookmark moves to the site panel), Ctrl+1–9 profiles (Dia's Alt+1–9) with Alt+1–9 taking Dia's Ctrl+1–9,
+  Ctrl+Z right after closing a tab reopens it, Ctrl+Shift+X extensions menu. In the Ctrl+T key hook; the hook
+  lets by only keys it sent itself (`kOwnKeys` in dwExtraInfo).
+- **Capsule buttons on hover**: Dia's capsule buttons (pinned extensions, copy link, site ⋯) are moved over the
+  pill from the page's toolbar, but the page's rounded Border (radius 7) clips them, so they never showed.
+  Look-alikes in the pill now press Dia's buttons. The site label also kept its narrow width after the first
+  hover (fixed).
+- **Loading in the pill**: Dia's loading indicator is clipped the same way; the pill shows a live visual-surface
+  copy of it (the Mac's Show Loading Progress).
+- `cleanSearchBox` turned on (the Mac's Compact Command Bar).
 
-## Cause (found)
+## Not done
 
-This comes from the `arcPinnedTabs` tweak in `src/ui.cpp`, in the section that starts at `// Arc pinned tabs` (around line 5436):
+- **Open new tabs next to current**: Dia appends new tabs at the end; moving one needs a synthetic drag.
+- **Peek from pinned tabs**: Dia already opens a pinned tab's cross-site link in a new tab; turning that into a
+  Peek needs a reliable "the active tab is pinned" signal (the selected tile only has a brighter fill).
+- **Close tabs from the Ctrl+Tab switcher**: the switcher isn't a reachable XAML element or popup.
+- **Little Dia**: Edge is the default browser on the PC, so links from other apps don't reach Dia.
+- Drag window from page, Open sidebar instantly, Keep folders open: not looked at.
+- **Open question for the user**: the Mac shows **−** (not ✕) on pinned tabs with a page open, and that −
+  closes the page and keeps the pin. Windows shows ✕ there (as this handover asked) and − only for "back to
+  pinned page".
 
-- `PlacePinButton` (around 5596) shows our own ✕ / – button in a popup over the right end of the row.
-- `PressPinButton` (around 5518) presses Dia's own **"Close tab"** button on the row when the ✕ is clicked.
+## Working on the PC
 
-On a pinned tab, Dia's "Close tab" **removes the pin**. The code comment says so: Dia hides that button on pinned tabs outside folders, and its context-menu Close does the same. So the ✕ deletes the bookmark.
+The Claude app now runs on the PC itself. Build locally (`build.cmd` works with VS 2022 Community):
+`~/Claude/WinDiaTweaks/dev-build.sh` builds; Dia must be closed to swap the DLL, which
+`~/wdt-swap.ps1` does (close Dia, copy the build into `~/WinDiaTweaks/bin`, start DiaLauncher). After adding a
+tweak to `tweaks.conf`, merge it into the installed conf:
+`~/WinDiaTweaks/bin/diatweaks.exe merge-conf <repo>\tweaks.conf <home>\WinDiaTweaks\bin\tweaks.conf`.
 
-## What the fix needs
+Everything that touches Dia's desktop runs through `~/wdt-task.ps1 -Script <script>` (a scheduled task in the
+desktop session). Each task launch steals focus, which closes Dia's popups and the Ctrl+T bar, so do keys,
+clicks and screenshots in one run: `~/wdt-seq.ps1 -Steps "focus;keys:^t;sleep:800;shot:C:\path.png;..."`
+(steps: focus, keys, type, sleep, move, click, rclick, wheel, kdown, kup, shot, probe, wins).
 
-There's a cheap way and a real way. Do the cheap one only if the real one isn't possible.
-
-1. **Find Dia's "close but keep" path, if it has one.** Possible places:
-   - An item in the pinned tab's right-click menu, such as Unload, Close, Reset or Archive.
-   - A ViewModel command or method in `Dia.dll`, for example something like `UnloadTab`, `Discard` or `ResetPinned`.
-   - Ctrl+W on a pinned tab, if Dia keeps the pin there (Dia on the Mac does).
-
-   If one exists, make `PressPinButton` (and Ctrl+W, if needed) use it instead of "Close tab".
-2. **If Dia has nothing,** stop the ✕ from deleting:
-   - At minimum: on a pinned tab at its own page, don't press "Close tab". Instead, switch to another tab, as Arc does on close, and leave the pinned row alone.
-   - Unloading the page may then need a call into Dia that hasn't been found yet.
-   - Don't recreate the pin after the delete. That's fragile, and it changes the order and folders.
-
-Also check pinned tabs **inside folders**. There Dia shows its own ✕ (`PlacePinButton` skips those rows). Find out whether that ✕ also deletes the pin.
-
-## Investigation so far
-
-- **`diatweaks probe FLYOUTS`** lists only the right-click menus Dia has already built. The tab rows build theirs when opened, so they didn't show up. The only menus listed were the address box menu and the extensions menu (OverflowButton).
-- **A string search** of the Dia package for these words was started on the PC:
-  - Back to Pinned URL
-  - Unload
-  - Close Pinned
-  - Reset Pinned
-  - Pinned Tab
-  - Remove from
-  - Unpin
-  - Close Tab
-  - Archive
-
-  The script is `C:\Users\amirr\strs.ps1`, run over ssh. It scans every dll, which is slow, and it hadn't returned anything when the session ended. Run it again on `Dia.dll` alone, plus any `.pri` / `.xbf` files, to make it fast.
-- **Dia's version** is 1.7.2.2, at `C:\Program Files\WindowsApps\TheBrowserCompany.Dia_1.7.2.2_x64__ttt1ap7aakyb4\`.
-- **The Mac version** for comparison is `~/DiaTweaks/src/dylib/Patches/PinnedTabCloseButton/`. There it only clears `suppressesCloseButton`, because Dia's own close on the Mac keeps the pin.
-
-## Working with the PC
-
-- `ssh amirr@dude-pc` (over Tailscale) opens a Git Bash shell.
-- **Install location:** `~/WinDiaTweaks/bin/`, with `diatweaks.exe`, `tap.log`, `probe.out` and `tweaks.conf`.
-- **Commands that need Dia's desktop session** have to go through the scheduled-task helper, because over plain ssh `diatweaks.exe` says Dia isn't running with tweaks. That includes `probe`.
-
-  `wdt-task.ps1` runs another script in the user's desktop session and prints its output:
-
-  ```bash
-  ssh amirr@dude-pc 'powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\amirr\wdt-task.ps1" -Script wdt-probe2.ps1'
-  ```
-
-  `wdt-probe2.ps1` currently runs `diatweaks.exe probe FLYOUTS` and prints `probe.out`. Edit it for other probe names. Useful ones:
-  - `Name*` dumps the tree under that element.
-  - `HIT:x,y` shows what's under a point.
-  - `FOCUS` shows which element has keyboard focus.
-- **Screenshots:** `wdt-task.ps1 -Script wdt-shot.ps1` saves `~/wdt-shot.png`. Copy it back with scp.
-- **To release:**
-  1. Push a tag `v1.3.2-mac.N`. The CI workflow `release.yml` builds `WinDiaTweaks.zip` for it.
-  2. Then install it on the PC (this restarts Dia):
-
-     ```bash
-     ssh amirr@dude-pc 'powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\amirr\wdt-task.ps1" -Script wdt-update.ps1 -ScriptArgs "-Tag v1.3.2-mac.N -Sha256 <zip sha256>"'
-     ```
+- Hover only registers with **absolute** mouse moves (`wdt-seq`'s move/click glide in from the right).
+- SendKeys input is injected; the key hook handles it like real keys.
+- Screen is 3840×2160 at 150%: screen pixels = DIPs × 1.5 (probes print DIPs).
+- Probes (`~/wdt-probe.ps1 -Names "..."`): `ROWS`, `TILES`/`LIST` (switch targets), `ROWRMENU:i` (right-click a
+  row and list its menu), `ROWRITEM:i:Text_with_underscores` (press a menu item), `ROWBTN:i:Close_tab`,
+  `MENU`, `PINSTATE`, `TABLIST`, `UP:Name`, `NAMES:text`, `HIT:x,y`, `FOCUS`, `Name*`. Async menu output goes
+  to `probe2.out`.
+- Test pins: Ctrl+T a throwaway URL, then drag its row above the divider (`~/wdt-drag.ps1`), or Ctrl+D (→ dock
+  tile). Delete with `ROWBTN:i:Close_tab`. Check `…\User Data\Default\Bookmarks` for stray test bookmarks.
 
 ## Ground rules from the user
 
-- Don't test intrusively while the user is using the PC, for example clicking, moving the pointer or restarting Dia. Ask first.
-- **Never test by closing a real pinned tab.** That's exactly what deletes the user's bookmarks.
+- Don't test intrusively while the user is using the PC; check idle time first (`~/wdt-idle.ps1`).
+- Never test by closing a real pinned tab.
 - On the Mac, don't restart Dia or switch tabs without asking.
 - Don't copy the user's account email from the logs anywhere.
-
-## Still unverified from the last change (v1.3.2-mac.7)
-
-The Windows site panel (the extensions panel) and the capsule extensions are installed. Nobody has looked at them on screen yet, and Bookmark (Ctrl+D) and the extension tiles haven't been tried.
+- Push and release only when asked. Release: push a tag `v1.3.2-mac.N` (CI builds `WinDiaTweaks.zip`), then
+  `wdt-update.ps1 -Tag … -Sha256 …`.
