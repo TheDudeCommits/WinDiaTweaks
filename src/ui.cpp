@@ -7576,8 +7576,11 @@ static void UpdateArcMirrors(ArcState& st) {
         box.HorizontalAlignment(mux::HorizontalAlignment::Stretch);
         box.VerticalAlignment(mux::VerticalAlignment::Stretch);
         muxc::Grid::SetColumnSpan(box, (std::max)(1, (int)url.ColumnDefinitions().Size()));
+        box.IsHitTestVisible(false);
+        winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::GetElementVisual(box).Opacity(0);  // (hidden until the pointer comes)
         url.Children().Append(box);
         st.mirrorBox = winrt::make_weak(box);
+        st.mirrorsShown = false;
     }
     if (box.Visibility() != mux::Visibility::Visible) box.Visibility(mux::Visibility::Visible);
     muxm::Brush ink = BrushRes(L"TextFillColorSecondaryBrush", Rgba(255, 255, 255, 0xc5));
@@ -7707,14 +7710,16 @@ static void UpdateArcLabel(ArcState& st) {
             left = (std::max)(12.0, reb.TransformToVisual(url).TransformPoint({0, 0}).X + reb.Padding().Left + 1);
         auto host = ArcHost(st);
         auto trailing = host ? FindByName(host, L"UrlBarTrailingStack") : nullptr;
-        if (!st.hover)
+        if (!st.hover) {
             right = 12;  // buttons hidden: the site can use the whole pill
-        else if (trailing && trailing.ActualWidth() > 0)
-            right = url.as<mux::FrameworkElement>().ActualWidth() - trailing.TransformToVisual(url).TransformPoint({0, 0}).X + 4;
-        if (st.hover && st.extWidth > 0)  // and clear of the extensions before them
-            right = (std::max)(right, url.as<mux::FrameworkElement>().ActualWidth() - st.extLeft + 4);
-        else
-            right = label.Margin().Right > 0 ? label.Margin().Right : right;  // not measured yet: keep it put
+        } else {
+            bool measured = false;
+            if (trailing && trailing.ActualWidth() > 0)
+                right = url.as<mux::FrameworkElement>().ActualWidth() - trailing.TransformToVisual(url).TransformPoint({0, 0}).X + 4, measured = true;
+            if (st.extWidth > 0)  // and clear of the extensions before them
+                right = (std::max)(right, url.as<mux::FrameworkElement>().ActualWidth() - st.extLeft + 4), measured = true;
+            if (!measured && label.Margin().Right > 0) right = label.Margin().Right;  // not measured yet: keep it put
+        }
     } catch (...) {
     }
     mux::Thickness m{left, 0, right, 0};
