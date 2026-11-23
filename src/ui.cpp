@@ -782,13 +782,13 @@ static void ApplyPreset(const std::wstring& preset) {
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
                                                L"peek",           L"tidyTabs",            L"mediaControls",
-                                               L"arcPinnedTabs", L"collapsePinned"};
+                                               L"arcPinnedTabs", L"collapsePinned", L"pinTabShortcut", L"profileShortcuts", L"undoCloseTab", L"extensionsShortcut"};
     // Arc (Windows): the same, but like Arc for Windows the toolbar stays, in the sidebar's color, with
     // the site centered in it (the Centered address bar).
     static const std::set<std::wstring> arcWindows = {L"edgeToEdge",       L"squareCorners",    L"arcUrlBar",
                                                       L"floatingNewTab",   L"hideTabSearchButton", L"hideChatButton",
                                                       L"hideTabHoverCard", L"windowMaterial",   L"peek",
-                                                      L"tidyTabs",         L"mediaControls",    L"arcPinnedTabs", L"collapsePinned"};
+                                                      L"tidyTabs",         L"mediaControls",    L"arcPinnedTabs", L"collapsePinned", L"pinTabShortcut", L"undoCloseTab", L"extensionsShortcut"};
     bool isArc = preset == L"arc", isArcWindows = preset == L"arcWindows";
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
@@ -9184,6 +9184,12 @@ static thread_local int t_clearFrames = 0;
 static thread_local winrt::event_token t_clearToken{};
 static HWND g_arcMsgWnd = nullptr;
 static const UINT WM_ARC_CTRL_T = WM_APP + 0x3b1, WM_ARC_ENTER = WM_APP + 0x3b2;
+static const ULONG_PTR kOwnKeys = 0x0D1A7EE5;  // (dwExtraInfo of the keys we send: the hook lets them by)
+static const UINT WM_MAC_KEY = WM_APP + 0x3b3;  // (Mac shortcuts) wParam: what, lParam: the digit
+// Which key tweaks are on, for the hook's thread (it mustn't read the config itself).
+static std::atomic<bool> g_keyFloating{false}, g_keyPin{false}, g_keyProfiles{false}, g_keyUndo{false}, g_keyExt{false};
+static std::atomic<bool> g_undoArmed{false};  // a tab just closed, nothing typed or clicked since
+static void MacKey(int what, int digit);
 
 static mux::FrameworkElement FocusedQueryBox() {
     for (auto h : FindNodes(L"QueryTextBox")) {
@@ -9205,6 +9211,7 @@ static void SendKeys(std::initializer_list<std::pair<WORD, bool>> keys) {  // (v
         i.type = INPUT_KEYBOARD;
         i.ki.wVk = vk;
         i.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+        i.ki.dwExtraInfo = kOwnKeys;
         in.push_back(i);
     }
     SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
@@ -9380,6 +9387,8 @@ static LRESULT CALLBACK ArcMsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_ARC_CTRL_T) {
             Log("arc: Ctrl+T -> floating new tab bar");
             StartNewTabMode();
+        } else if (msg == WM_MAC_KEY) {
+            MacKey((int)wp, (int)lp);
         } else if (msg == WM_ARC_ENTER) {
             // The hook went by a flag up to a tick old: focus left the box since, so give the Enter back.
             if (t_newTabMode && FocusedQueryBox()) SubmitInNewTab();
@@ -9399,11 +9408,45 @@ static bool DiaIsForeground() {
 // Low-level keyboard hook, on a thread of its own (see llhook.h): it must not touch XAML or the UI
 // thread's state, only the atomics above. Set only while Floating New Tab is on; acts only while Dia is
 // the active app.
+// The Mac's shortcuts (DiaTweaks), Ctrl standing for ⌘ as everywhere in Dia: Ctrl+D pins or unpins the
+// tab (Dia's Ctrl+Shift+D: bookmarking is in the site panel, as on the Mac), Ctrl+1–9 switch profiles
+// (Dia's Alt+1–9) and Alt+1–9 take over Dia's Ctrl+1–9 (the Nth tab), Ctrl+Z right after closing a tab
+// brings it back (Dia's Ctrl+Shift+T) as long as nothing was typed or clicked since, and Ctrl+Shift+X
+// opens a menu of your extensions. True: the key is ours (the UI thread does the rest).
+static bool MacKeyHook(DWORD vk) {
+    switch (vk) {
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+    case VK_MENU: case VK_LMENU: case VK_RMENU: case VK_LWIN: case VK_RWIN:
+        return false;
+    }
+    bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000, alt = GetAsyncKeyState(VK_MENU) & 0x8000,
+         shift = GetAsyncKeyState(VK_SHIFT) & 0x8000, win = (GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000;
+    bool armed = g_undoArmed.exchange(false);  // (anything typed ends the chance to undo)
+    if (win) return false;
+    auto post = [](int what, int digit) { PostMessageW(g_arcMsgWnd, WM_MAC_KEY, what, digit); };
+    if (g_keyUndo && vk == 'Z' && ctrl && !alt && !shift && armed) return post(4, 0), true;
+    if (g_keyPin && vk == 'D' && ctrl && !alt && !shift) return post(1, 0), true;
+    if (g_keyProfiles && vk >= '1' && vk <= '9' && !shift) {
+        if (ctrl && !alt) return post(2, (int)(vk - '0')), true;
+        if (alt && !ctrl) return post(3, (int)(vk - '0')), true;
+    }
+    if (g_keyExt && vk == 'X' && ctrl && shift && !alt) return post(5, 0), true;
+    return false;
+}
+
+// (Undo Closing a Tab) a click anywhere ends the chance to undo.
+static LRESULT CALLBACK MacMouseHook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN || wp == WM_XBUTTONDOWN))
+        g_undoArmed = false;
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
 static LRESULT CALLBACK ArcKeyHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
         auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+        if (k->dwExtraInfo != kOwnKeys && DiaIsForeground() && MacKeyHook(k->vkCode)) return 1;
         // (Our own Ctrl+L / Alt+Enter never match below, so they can't loop.)
-        if ((k->vkCode == 'T' || k->vkCode == VK_RETURN) && DiaIsForeground()) {
+        if (g_keyFloating && (k->vkCode == 'T' || k->vkCode == VK_RETURN) && DiaIsForeground()) {
             bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000, alt = GetAsyncKeyState(VK_MENU) & 0x8000,
                  shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
             if (k->vkCode == 'T' && ctrl && !alt && !shift && g_arcPassCtrlT.exchange(false)) {
@@ -9425,7 +9468,7 @@ static LowLevelHookThread g_arcHooks;
 static DWORD g_arcThread = 0;  // the UI thread that owns the message window (and new-tab mode)
 
 // The key hook while Floating New Tab is on; none (no cost to your typing) while it's off.
-static void SetArcKeys(bool on) {
+static void SetArcKeys(bool on, bool mouse = false) {
     if (!g_arcThread) {
         if (!on) return;
         WNDCLASSW wc{};
@@ -9439,17 +9482,94 @@ static void SetArcKeys(bool on) {
     if (GetCurrentThreadId() != g_arcThread) return;
     static bool failed = false;  // (not tried again every tick: once more after the tweak is turned off and on)
     if (!on) failed = false;
+    static bool withMouse = false;
+    if (on && g_arcHooks.Running() && mouse != withMouse) g_arcHooks.Stop();  // (started again below, with or without it)
     if (on == g_arcHooks.Running() || (on && failed)) return;
     if (!on) {
         g_arcHooks.Stop();
         g_arcPassCtrlT = false;
         g_arcEnterSubmits = false;
-    } else if (!g_arcHooks.Start(nullptr, ArcKeyHook)) {
+    } else if (withMouse = mouse, !g_arcHooks.Start(mouse ? MacMouseHook : nullptr, ArcKeyHook)) {
         failed = true;
         Log("Arc keys: hook failed %lu", g_arcHooks.Error());
     } else {
         Log("Arc keys: hook on");
     }
+}
+
+static void SendKeyList(const std::vector<std::pair<WORD, bool>>& keys) {  // (vk, down)
+    std::vector<INPUT> in;
+    for (auto& [vk, down] : keys) {
+        INPUT i{};
+        i.type = INPUT_KEYBOARD;
+        i.ki.wVk = vk;
+        i.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+        i.ki.dwExtraInfo = kOwnKeys;
+        in.push_back(i);
+    }
+    SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
+}
+
+static HWND TopWindowFor(const mux::XamlRoot& root);
+
+// Extensions Shortcut: Dia's extensions menu (the one on its puzzle button), opened under the address.
+static void ShowExtensionsMenu() {
+    HWND fg = GetForegroundWindow();
+    for (auto h : FindNodes(L"OverflowButton")) {
+        auto b = Obj<mux::FrameworkElement>(h);
+        auto mf = b ? b.ContextFlyout().try_as<muxc::MenuFlyout>() : nullptr;
+        if (!mf || !b.XamlRoot() || TopWindowFor(b.XamlRoot()) != fg) continue;
+        mux::FrameworkElement anchor = ArcPill(b.XamlRoot());
+        if (!anchor || !ShownOnScreen(anchor)) anchor = ShownOnScreen(b) ? b : b.XamlRoot().Content().try_as<mux::FrameworkElement>();
+        if (!anchor) continue;
+        muxc::Primitives::FlyoutShowOptions opt;
+        opt.Placement(muxc::Primitives::FlyoutPlacementMode::BottomEdgeAlignedLeft);
+        mf.ShowAt(anchor, opt);
+        return Log("keys: extensions menu");
+    }
+    Log("keys: no extensions menu");
+}
+
+// (WM_MAC_KEY) what the hook took: Dia's own shortcut for it, with the keys still held let go of and
+// pressed again around it.
+static void MacKey(int what, int digit) {
+    bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000, alt = GetAsyncKeyState(VK_MENU) & 0x8000;
+    WORD d = (WORD)('0' + digit);
+    const WORD quiet = 0xE8;  // (an unassigned key: Alt let go of after it opens no menu)
+    std::vector<std::pair<WORD, bool>> k;
+    switch (what) {
+    case 1:  // pin / unpin: Ctrl+Shift+D
+    case 4:  // reopen closed tab: Ctrl+Shift+T
+        if (!ctrl) k.push_back({VK_CONTROL, true});
+        k.insert(k.end(), {{VK_SHIFT, true}, {WORD(what == 1 ? 'D' : 'T'), true}, {WORD(what == 1 ? 'D' : 'T'), false}, {VK_SHIFT, false}});
+        if (!ctrl) k.push_back({VK_CONTROL, false});
+        Log(what == 1 ? "keys: Ctrl+D -> pin/unpin" : "keys: Ctrl+Z -> reopen closed tab");
+        break;
+    case 2:  // profile N: Alt+N
+        if (ctrl) k.push_back({VK_CONTROL, false});
+        k.insert(k.end(), {{VK_MENU, true}, {d, true}, {d, false}, {VK_MENU, false}});
+        if (ctrl) k.push_back({VK_CONTROL, true});
+        break;
+    case 3:  // the Nth tab: Ctrl+N
+        if (alt) k.insert(k.end(), {{quiet, true}, {quiet, false}, {VK_MENU, false}});
+        k.insert(k.end(), {{VK_CONTROL, true}, {d, true}, {d, false}, {VK_CONTROL, false}});
+        if (alt) k.insert(k.end(), {{VK_MENU, true}, {quiet, true}, {quiet, false}});
+        break;
+    case 5:
+        return ShowExtensionsMenu();
+    default:
+        return;
+    }
+    SendKeyList(k);
+}
+
+// (Undo Closing a Tab) a tab row went away: the next Ctrl+Z, if nothing comes between, brings it back.
+static void WatchClosedTabs() {
+    static thread_local int count = -1;
+    if (!g_keyUndo) return void(count = -1);
+    int n = (int)AllTabRows().size();
+    if (count >= 0 && n < count) g_undoArmed = true;
+    count = n;
 }
 
 // The empty-bar mode ends when the command bar closes. (And the key hook hears where it stands.)
@@ -10588,7 +10708,12 @@ bool Ui_Tick() {
         stage = "hiddenToolbar";
         UpdateHiddenToolbar();
         stage = "commandBar";
-        SetArcKeys(Engine_TweakOn(L"floatingNewTab"));
+        g_keyFloating = Engine_TweakOn(L"floatingNewTab");
+        g_keyPin = Engine_TweakOn(L"pinTabShortcut");
+        g_keyProfiles = Engine_TweakOn(L"profileShortcuts");
+        g_keyUndo = Engine_TweakOn(L"undoCloseTab");
+        g_keyExt = Engine_TweakOn(L"extensionsShortcut");
+        SetArcKeys(g_keyFloating || g_keyPin || g_keyProfiles || g_keyUndo || g_keyExt, g_keyUndo);
         if ((Engine_TweakOn(L"floatingNewTab") || ArcWindowsOn()) && !ArcSidebarOn())
             HookCommandBarPopovers();  // (Arc mode hooks them already)
         stage = "newTab";
@@ -10598,7 +10723,7 @@ bool Ui_Tick() {
         Peek_Tick();
         stage = "hoverCards";
         UpdateHoverCards();
-        if (tick % 3 == 1) stage = "pinnedTabs", UpdatePinnedTabs(), UpdatePinnedMarks(), UpdateCollapsePinned();
+        if (tick % 3 == 1) stage = "pinnedTabs", UpdatePinnedTabs(), UpdatePinnedMarks(), UpdateCollapsePinned(), WatchClosedTabs();
         UpdateCleanSearchBox();
         History_Tick();
         UpdateTidyTabs();
