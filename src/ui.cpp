@@ -228,6 +228,8 @@ static void DescribeElement(std::ostringstream& o, const mux::FrameworkElement& 
     }
     try {
         auto v = winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::GetElementVisual(fe);
+        if (v.Opacity() != 1) o << " vop=" << v.Opacity();
+        if (!v.IsVisible()) o << " vhidden";
         if (auto clip = v.Clip()) {
             o << " visualclip=" << N(std::wstring(winrt::get_class_name(clip)));
             if (auto gc = clip.try_as<winrt::Microsoft::UI::Composition::CompositionGeometricClip>())
@@ -442,6 +444,15 @@ static void RunProbe() {
                         auto nmf = std::wstring(ffe.Name());
                         o << "focus[" << depth << "] " << N(std::wstring(winrt::get_class_name(ffe))) << " \"" << N(nmf) << "\"\n";
                     }
+                break;
+            }
+            continue;
+        }
+        if (nm.rfind(L"UP:", 0) == 0) {  // UP:Name: that element and every ancestor, up to the root
+            for (auto h : FindNodes(nm.substr(3))) {
+                int depth = 0;
+                for (mux::DependencyObject d = Obj<mux::DependencyObject>(h); d && depth < 60; d = muxm::VisualTreeHelper::GetParent(d), depth++)
+                    if (auto fe = d.try_as<mux::FrameworkElement>()) DescribeElement(o, fe, 0);
                 break;
             }
             continue;
@@ -6832,6 +6843,10 @@ struct ArcState {
     double extOpacity = 1, extLeft = 0, extWidth = 0;  // (extLeft, extWidth: what the pill shows, pill coordinates)
     bool extHit = true, panelOpen = false;
     winrt::weak_ref<muxc::Button> panelButton;  // ours, under Dia's site button, which lets clicks through to it
+    // (Mirrors) look-alikes of Dia's capsule buttons, drawn in the pill over Dia's own (see UpdateArcMirrors)
+    winrt::weak_ref<muxc::Canvas> mirrorBox;
+    std::vector<std::pair<winrt::weak_ref<muxc::Button>, muxc::Button>> mirrors;  // (Dia's, ours)
+    bool mirrorsShown = false;
     winrt::weak_ref<mux::UIElement> site;
     // Dia's ☆ button, out of the pill (it's in the panel, as on the Mac): Dia's own visibility, and our watch.
     winrt::weak_ref<mux::FrameworkElement> bookmark;
@@ -7176,7 +7191,9 @@ static void RestoreArcPanel(ArcState& st) {
     st.bookmark = nullptr;
     st.bookmarkBinding = nullptr;
     st.bookmarkLocal = nullptr;
-    if (auto p = st.panelButton.get()) p.Visibility(mux::Visibility::Collapsed);
+    if (auto p = st.panelButton.get()) p.Visibility(mux::Visibility::Collapsed), p.Content(nullptr);
+    if (auto box = st.mirrorBox.get()) box.Visibility(mux::Visibility::Collapsed);
+    st.mirrors.clear();
 }
 
 // Presses one of Dia's buttons once our panel has closed, so whatever it opens isn't closed with it.
@@ -7490,6 +7507,162 @@ static void UpdateArcPanel(ArcState& st) {
     if (ext.IsHitTestVisible() != show) ext.IsHitTestVisible(show);
 }
 
+// ---- Mirrors. Dia's capsule buttons (the two pinned extensions, copy link, the site button) stay in its
+// toolbar, moved over the pill (see FlushArcTrailing), but the page's rounded corners clip them there, so
+// they never showed. Each gets a look-alike of ours in the pill, laid exactly over it: the same icon, and a
+// click that presses Dia's button, which is still in place, so its menu or popup opens where it should.
+// The site button's look-alike is our panel button, which opens the site panel.
+static void CopyButtonIcon(const muxc::Button& from, const muxc::Button& to, const muxm::Brush& ink) {
+    mux::UIElement icon{nullptr};
+    // An extension's picture first (its button also holds a placeholder glyph), else the button's glyph.
+    auto img = FindVisual(from, [](const mux::DependencyObject& d) {
+                   auto i = d.try_as<muxc::Image>();
+                   return i && i.Source() && i.Visibility() == mux::Visibility::Visible;
+               }).try_as<muxc::Image>();
+    auto fi = img ? nullptr : FindVisual(from, [](const mux::DependencyObject& d) {
+                                  auto f = d.try_as<muxc::FontIcon>();
+                                  return f && f.Visibility() == mux::Visibility::Visible;
+                              }).try_as<muxc::FontIcon>();
+    if (img) {
+        auto old = to.Content().try_as<muxc::Image>();
+        if (old && old.Source() == img.Source()) return;
+        muxc::Image i;
+        i.Source(img.Source());
+        i.Width(img.ActualWidth() > 0 ? img.ActualWidth() : 16);
+        i.Height(img.ActualHeight() > 0 ? img.ActualHeight() : 16);
+        icon = i;
+    } else if (fi) {
+        auto old = to.Content().try_as<muxc::FontIcon>();
+        if (old && old.Glyph() == fi.Glyph()) {
+            if (old.Foreground() != ink) old.Foreground(ink);
+            return;
+        }
+        muxc::FontIcon f;
+        f.Glyph(fi.Glyph());
+        f.FontFamily(fi.FontFamily());
+        f.FontSize(fi.FontSize());
+        f.Foreground(ink);
+        f.Opacity(0.62);  // (the Mac's icon grey, as the header's buttons: ArcStyleHeader)
+        icon = f;
+    }
+    if (icon) to.Content(icon);
+}
+
+static void StyleMirror(const muxc::Button& b) {
+    auto res = b.Resources();
+    auto clear = muxm::SolidColorBrush(Rgba(0, 0, 0, 0));
+    res.Insert(winrt::box_value(L"ButtonBackground"), clear);
+    res.Insert(winrt::box_value(L"ButtonBackgroundPointerOver"), BrushRes(L"SubtleFillColorSecondaryBrush", Rgba(255, 255, 255, 0x0f)));
+    res.Insert(winrt::box_value(L"ButtonBackgroundPressed"), BrushRes(L"SubtleFillColorTertiaryBrush", Rgba(255, 255, 255, 0x0a)));
+    for (auto k : {L"ButtonBorderBrush", L"ButtonBorderBrushPointerOver", L"ButtonBorderBrushPressed"}) res.Insert(winrt::box_value(k), clear);
+    b.Background(clear);
+    b.BorderThickness({0, 0, 0, 0});
+    b.Padding({0, 0, 0, 0});
+    b.MinWidth(0), b.MinHeight(0);
+    b.HorizontalContentAlignment(mux::HorizontalAlignment::Center);
+    b.VerticalContentAlignment(mux::VerticalAlignment::Center);
+    b.UseSystemFocusVisuals(false);
+}
+
+static void UpdateArcMirrors(ArcState& st) {
+    auto url = st.url.get().try_as<muxc::Grid>();
+    auto host = url ? ArcHost(st) : nullptr;
+    auto trailing = host ? FindByName(host, L"UrlBarTrailingStack").try_as<muxc::Panel>() : nullptr;
+    if (!url || !host || host != st.address.get() || !trailing || url.ActualWidth() <= 0) return;
+    auto box = st.mirrorBox.get();
+    if (!box) {
+        box = muxc::Canvas{};
+        box.Name(L"diatweaksArcMirrors");
+        box.HorizontalAlignment(mux::HorizontalAlignment::Stretch);
+        box.VerticalAlignment(mux::VerticalAlignment::Stretch);
+        muxc::Grid::SetColumnSpan(box, (std::max)(1, (int)url.ColumnDefinitions().Size()));
+        url.Children().Append(box);
+        st.mirrorBox = winrt::make_weak(box);
+    }
+    if (box.Visibility() != mux::Visibility::Visible) box.Visibility(mux::Visibility::Visible);
+    muxm::Brush ink = BrushRes(L"TextFillColorSecondaryBrush", Rgba(255, 255, 255, 0xc5));
+    if (auto label = st.label.get()) ink = label.Foreground();
+
+    // Which of Dia's buttons show in the capsule now: the pinned extensions inside their clip, then the
+    // trailing ones (☆ is collapsed: it lives in the panel). The site button is the panel button's.
+    std::vector<muxc::Button> want;
+    auto toolbar = ArcToolbarOf(host);
+    auto ext = toolbar ? FindByName(toolbar, L"PinnedExtensionsHost") : nullptr;
+    if (ext && st.extWidth > 0)
+        for (auto& b : PinnedExtensionButtons(ext))
+            try {
+                if (b.TransformToVisual(ext).TransformPoint({(float)b.ActualWidth(), 0}).X <= st.extWidth + 0.5) want.push_back(b);
+            } catch (...) {
+            }
+    muxc::Button site{nullptr};
+    for (auto const& c : trailing.Children())
+        if (auto b = c.try_as<muxc::Button>(); b && b.Visibility() == mux::Visibility::Visible && b.ActualWidth() > 0) {
+            if (b.Name() == L"SiteMenuButton") site = b;
+            else want.push_back(b);
+        }
+
+    std::erase_if(st.mirrors, [&](auto& m) {
+        auto dia = m.first.get();
+        if (dia && std::find(want.begin(), want.end(), dia) != want.end()) return false;
+        uint32_t i;
+        if (box.Children().IndexOf(m.second, i)) box.Children().RemoveAt(i);
+        return true;
+    });
+    auto place = [&](const muxc::Button& dia, const muxc::Button& mine) {
+        auto bg = FindByName(dia, L"BackgroundBorder");
+        mux::FrameworkElement shape = bg && bg.ActualWidth() > 0 ? bg : dia.as<mux::FrameworkElement>();
+        auto r = shape.TransformToVisual(url).TransformBounds({0, 0, (float)shape.ActualWidth(), (float)shape.ActualHeight()});
+        if (std::abs(muxc::Canvas::GetLeft(mine) - r.X) > 0.25) muxc::Canvas::SetLeft(mine, r.X);
+        if (std::abs(muxc::Canvas::GetTop(mine) - r.Y) > 0.25) muxc::Canvas::SetTop(mine, r.Y);
+        if (std::abs(mine.Width() - r.Width) > 0.25 || std::isnan(mine.Width())) mine.Width(r.Width);
+        if (std::abs(mine.Height() - r.Height) > 0.25 || std::isnan(mine.Height())) mine.Height(r.Height);
+        if (mine.CornerRadius() != dia.CornerRadius()) mine.CornerRadius(dia.CornerRadius());
+        CopyButtonIcon(dia, mine, ink);
+    };
+    for (auto& dia : want) {
+        auto it = std::find_if(st.mirrors.begin(), st.mirrors.end(), [&](auto& m) { return m.first.get() == dia; });
+        muxc::Button mine{nullptr};
+        if (it != st.mirrors.end()) mine = it->second;
+        else {
+            mine = muxc::Button{};
+            StyleMirror(mine);
+            auto name = winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::GetName(dia);
+            winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(mine, name);
+            if (!name.empty()) muxc::ToolTipService::SetToolTip(mine, winrt::box_value(name));
+            auto weak = winrt::make_weak(dia);
+            mine.Click([weak](auto&&, auto&&) {
+                if (auto d = weak.get()) PressButton(d, "capsule");
+            });
+            box.Children().Append(mine);
+            st.mirrors.push_back({winrt::make_weak(dia), mine});
+        }
+        try {
+            place(dia, mine);
+        } catch (...) {
+        }
+    }
+    // The site button: our panel button already sits over it and opens the panel; it takes Dia's icon.
+    if (auto pb = st.panelButton.get(); pb && site) {
+        StyleMirror(pb);
+        CopyButtonIcon(site, pb, ink);
+    }
+    // In and out with the pointer, as the trailing buttons fade (UpdateArcTrailing).
+    bool show = st.hover || st.panelOpen;
+    if (box.IsHitTestVisible() != show) box.IsHitTestVisible(show);
+    if (show != st.mirrorsShown) {
+        st.mirrorsShown = show;
+        try {
+            auto v = winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::GetElementVisual(box);
+            auto c = v.Compositor();
+            auto fade = c.CreateScalarKeyFrameAnimation();
+            fade.InsertKeyFrame(1.0f, show ? 1.0f : 0.0f);
+            fade.Duration(std::chrono::milliseconds(show ? 120 : 180));
+            v.StartAnimation(L"Opacity", fade);
+        } catch (...) {
+        }
+    }
+}
+
 static void AttachDisplay(ArcState& st, const mux::FrameworkElement& address);
 static void UpdateArcLabel(ArcState& st) {
     auto label = st.label.get();
@@ -7750,7 +7923,7 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
     url.PointerEntered([](wf::IInspectable const& sender, auto&&) {
         for (auto& [h, st] : t_arc)
             if (st.url.get() == sender.try_as<muxc::Panel>()) {
-                st.hover = true, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+                st.hover = true, UpdateArcTrailing(st, true), UpdateArcLabel(st), UpdateArcMirrors(st);
                 if (auto u = st.url.get()) u.Background(ArcPillBrush(u, true));
             }
     });
@@ -7760,7 +7933,7 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
         if (InBounds(sender.try_as<mux::FrameworkElement>(), e)) return;
         for (auto& [h, st] : t_arc)
             if (st.url.get() == sender.try_as<muxc::Panel>()) {
-                st.hover = false, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+                st.hover = false, UpdateArcTrailing(st, true), UpdateArcLabel(st), UpdateArcMirrors(st);
                 if (auto u = st.url.get()) u.Background(ArcPillBrush(u, false));
             }
     });
@@ -8392,6 +8565,7 @@ static void UpdateArcBar() {
         UpdateArcTrailing(st, !st.swapped);
         FlushArcTrailing(st);
         UpdateArcPanel(st);
+        UpdateArcMirrors(st);
         UpdateArcLabel(st);
         ArcStyleHeader(st);
         if (st.swapped) st.swapped = false, UpdateAddressField();
@@ -8949,7 +9123,7 @@ static void TrackArcPointer(const mux::FrameworkElement& el) {
                     auto u = st.url.get().try_as<mux::FrameworkElement>();
                     if (!u || u.XamlRoot() != xr) continue;
                     bool in = InBounds(u, e);
-                    if (in != st.hover) st.hover = in, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+                    if (in != st.hover) st.hover = in, UpdateArcTrailing(st, true), UpdateArcLabel(st), UpdateArcMirrors(st);
                 }
                 for (auto& [h, x] : t_arcWin) {
                     auto pill = x.pill.get();
