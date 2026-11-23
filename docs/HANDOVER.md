@@ -1,7 +1,7 @@
 # Handover: Windows Dia to match the Mac (Arc look)
 
-Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. Last release **`v1.3.2-mac.8`** (everything under "Done");
-the PC (`dude-pc`) runs a local build with the − change on top of it. Dia on the PC is now **1.7.3.2**.
+Branch: `mac-look` of TheDudeCommits/WinDiaTweaks. Last release **`v1.3.2-mac.9`** (everything under "Done"),
+which the PC (`dude-pc`) runs. Dia on the PC is now **1.7.3.2**.
 
 The reference is the MacBook Air's Dia with DiaTweaks (`~/DiaTweaks`, its settings in
 `~/Library/Preferences/com.diapatches.plist`), which is styled after Arc. Screen capture over ssh is blocked by
@@ -31,7 +31,7 @@ macOS privacy settings on both Macs, so the Mac source and settings were the ref
   copy of it (the Mac's Show Loading Progress).
 - `cleanSearchBox` turned on (the Mac's Compact Command Bar).
 
-## Done after v1.3.2-mac.8 (tested on a throwaway pin, committed, not released)
+## Done in v1.3.2-mac.9 (tested on a throwaway pin)
 
 - **− on open pinned tabs, as on the Mac** (the user's choice): the pinned tab's button is now the Mac's −
   ("Minus Button on Open Pinned Tabs"), and it closes the page and keeps the pin, also on a tab that has moved
